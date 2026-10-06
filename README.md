@@ -71,9 +71,17 @@ kaldığınız sayfaya geri döner.
 
 ### Hazır sürüm
 
-Henüz yayınlanmış bir sürüm yok. Kendiniz derlemek için **Actions → Build Desktop App → Run workflow**
-çalıştırın; Linux (AppImage, tar.gz) ve Windows (kurulum, portable) dosyaları iş bitince indirilebilir.
-Ya da aşağıdaki gibi kaynaktan çalıştırın.
+[**Releases**](https://github.com/il4pt/rovalra-desktop/releases/latest) sayfasından indirin:
+
+| Sistem | Dosya | Not |
+|---|---|---|
+| Linux | `RoValra-Desktop-*-linux-x86_64.AppImage` | `chmod +x` ile çalıştırılabilir yapıp açın |
+| Linux | `RoValra-Desktop-*-linux-x64.tar.gz` | Arşivi açıp `rovalra-desktop` dosyasını çalıştırın |
+| Windows | `RoValra-Desktop-*-win-x64-setup.exe` | Kurulum |
+| Windows | `RoValra-Desktop-*-win-x64-portable.exe` | Kurulumsuz, tek dosya |
+
+> Windows sürümleri imzasız olduğu için SmartScreen "tanınmayan uygulama" uyarısı verebilir:
+> **Ek bilgi → Yine de çalıştır**.
 
 ### Linux gereksinimleri
 

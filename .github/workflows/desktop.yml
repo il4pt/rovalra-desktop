@@ -1,5 +1,7 @@
 name: Build Desktop App
 
+# Manual runs build and upload artifacts; pushing a "desktop-v*" tag also
+# publishes a GitHub release with the Linux and Windows builds attached.
 on:
     workflow_dispatch:
     push:
@@ -9,6 +11,7 @@ on:
 jobs:
     build:
         strategy:
+            fail-fast: false
             matrix:
                 include:
                     - os: ubuntu-latest
@@ -25,11 +28,30 @@ jobs:
               run: npm ci && npm run build
             - name: Build desktop app
               working-directory: desktop
-              run: npm ci && node prepare-extension.js && node pack.js ${{ matrix.target }}
+              # --publish never: releases are created by the job below, not electron-builder
+              run: npm ci && node prepare-extension.js && node pack.js ${{ matrix.target }} --publish never
             - uses: actions/upload-artifact@v4
               with:
                   name: rovalra-desktop-${{ runner.os }}
+                  if-no-files-found: error
                   path: |
                       desktop/release/*.AppImage
                       desktop/release/*.tar.gz
                       desktop/release/*.exe
+
+    release:
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        needs: build
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  path: dist
+                  merge-multiple: true
+            - uses: softprops/action-gh-release@v2
+              with:
+                  name: RoValra Desktop ${{ github.ref_name }}
+                  generate_release_notes: true
+                  files: dist/*
