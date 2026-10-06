@@ -1,0 +1,784 @@
+// Everything thumbnail related should go through this.
+
+// Thumbnail sizes - Gemini LOL so if any are wrong that would be why
+/*
+30x30
+42x42
+50x50
+60x62
+75x75
+110x110
+140x140
+150x150
+160x100
+160x600
+250x250
+300x250
+352x352
+420x420
+480x270
+512x512
+728x90
+768x432
+*/
+
+import { callRobloxApi } from '../api.js';
+import { getUserAvatar } from '../apis/avatar.js';
+import { settings } from '../settings/getSettings.js';
+
+const BATCH_SIZE = 50;
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 1500;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function prepareThumbnailRequestBody(body) {
+    const disableThumbnailBackground =
+        await settings.disableThumbnailBackground;
+    const disableThumbnailProfileFrame =
+        await settings.disableThumbnailProfileFrame;
+
+    if (!disableThumbnailBackground && !disableThumbnailProfileFrame) {
+        return body;
+    }
+
+    if (Array.isArray(body)) {
+        return body.map((request) =>
+            request && typeof request === 'object'
+                ? {
+                      ...request,
+                      ...(disableThumbnailBackground && {
+                          includeBackground: false,
+                      }),
+                      ...(disableThumbnailProfileFrame && {
+                          includeProfileFrame: false,
+                      }),
+                  }
+                : request,
+        );
+    }
+
+    if (body && typeof body === 'object') {
+        return {
+            ...body,
+            ...(disableThumbnailBackground && { includeBackground: false }),
+            ...(disableThumbnailProfileFrame && {
+                includeProfileFrame: false,
+            }),
+        };
+    }
+
+    return body;
+}
+
+async function fetchBatchData(
+    batch,
+    type,
+    size,
+    isCircular,
+    signal,
+    noCache = false,
+) {
+    const results = [];
+
+    if (type === 'PlayerToken') {
+        const requestBody = batch.map((item) => ({
+            token: item.id,
+            type: 'AvatarHeadshot',
+            size: size,
+            isCircular: isCircular,
+            includeBackground: true,
+            includeProfileFrame: true,
+            requestId: `0:${item.id}:AvatarHeadshot:${size}:png:regular`,
+        }));
+
+        try {
+            const response = await callRobloxApi({
+                subdomain: 'thumbnails',
+                endpoint: '/v1/batch',
+                method: 'POST',
+                body: await prepareThumbnailRequestBody(requestBody),
+                signal: signal,
+                noCache: noCache,
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                if (data && data.data) return data.data;
+            }
+        } catch (error) {
+            console.error(
+                `RoValra Thumbnails: Failed to fetch batch for "PlayerToken".`,
+                error,
+            );
+        }
+        return results;
+    }
+
+    if (type === 'GameThumbnail') {
+        const requestBody = batch.map((item) => ({
+            requestId: `${item.id}::GameThumbnail:${size}:webp:regular::`,
+            type: 'GameThumbnail',
+            targetId: item.id,
+            token: '',
+            format: 'webp',
+            size: size,
+            version: '',
+        }));
+
+        try {
+            const response = await callRobloxApi({
+                subdomain: 'thumbnails',
+                endpoint: '/v1/batch',
+                method: 'POST',
+                body: await prepareThumbnailRequestBody(requestBody),
+                signal: signal,
+                noCache: noCache,
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                if (data && data.data) return data.data;
+            }
+        } catch (error) {
+            console.error(
+                `RoValra Thumbnails: Failed to fetch batch for "GameThumbnail".`,
+                error,
+            );
+        }
+        return results;
+    }
+
+    if (type === 'GroupIcon') {
+        const groupIconSize = '150x150';
+        const requestBody = batch.map((item) => ({
+            requestId: `${item.id}:undefined:GroupIcon:${groupIconSize}:webp:regular:0::false`,
+            type: 'GroupIcon',
+            targetId: Number(item.id),
+            format: 'webp',
+            size: groupIconSize,
+        }));
+
+        try {
+            const response = await callRobloxApi({
+                subdomain: 'thumbnails',
+                endpoint: '/v1/batch',
+                method: 'POST',
+                body: await prepareThumbnailRequestBody(requestBody),
+                signal,
+                noCache,
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                if (data?.data) return data.data;
+            }
+        } catch (error) {
+            console.error(
+                'RoValra Thumbnails: Failed to fetch batch for "GroupIcon".',
+                error,
+            );
+        }
+        return results;
+    }
+
+    if (type === 'Outfit') {
+        const requestBody = batch.map((item) => ({
+            requestId: `${item.id}::Outfit:${size}:webp:regular:::true:false`,
+            type: 'Outfit',
+            targetId: Number(item.id),
+            token: '',
+            format: 'webp',
+            size: size,
+            version: '',
+            includeBackground: true,
+        }));
+
+        try {
+            const response = await callRobloxApi({
+                subdomain: 'thumbnails',
+                endpoint: '/v1/batch',
+                method: 'POST',
+                body: await prepareThumbnailRequestBody(requestBody),
+                signal,
+                noCache,
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                if (data?.data) return data.data;
+            }
+        } catch (error) {
+            console.error(
+                'RoValra Thumbnails: Failed to fetch batch for "Outfit".',
+                error,
+            );
+        }
+        return results;
+    }
+
+    const endpointMapping = {
+        AvatarHeadshot: {
+            path: '/v1/users/avatar-headshot',
+            idParam: 'userIds',
+        },
+        Avatar: {
+            path: '/v1/users/avatar',
+            idParam: 'userIds',
+        },
+        AvatarBust: {
+            path: '/v1/users/avatar-bust',
+            idParam: 'userIds',
+        },
+
+        GameThumbnail: { path: '/v1/games', idParam: 'placeIds' },
+        GameIcon: { path: '/v1/games/icons', idParam: 'universeIds' },
+        Asset: { path: '/v1/assets', idParam: 'assetIds' },
+        BundleThumbnail: {
+            path: '/v1/bundles/thumbnails',
+            idParam: 'bundleIds',
+        },
+        PlaceIcon: { path: '/v1/places/gameicons', idParam: 'placeIds' },
+        UserOutfit: { path: '/v1/users/outfits', idParam: 'userOutfitIds' },
+        Outfit: { path: '/v1/users/outfits', idParam: 'userOutfitIds' },
+        GamePass: { path: '/v1/game-passes', idParam: 'gamePassIds' },
+        BadgeIcon: { path: '/v1/badges/icons', idParam: 'badgeIds' },
+        GroupIcon: { path: '/v1/groups/icons', idParam: 'groupIds' },
+    };
+
+    const mapping = endpointMapping[type];
+    if (!mapping) return results;
+
+    const ids = batch.map((item) => item.id).join(',');
+
+    try {
+        const format = type === 'Asset' ? 'webp' : 'Png';
+        let endpointUrl = `${mapping.path}?${mapping.idParam}=${ids}&size=${size}&format=${format}&returnPolicy=PlaceHolder`;
+        if (isCircular) endpointUrl += `&isCircular=true`;
+        if (type === 'AvatarHeadshot') {
+            const includeBackground =
+                (await settings.disableThumbnailBackground) ? 'false' : 'true';
+            const includeProfileFrame =
+                (await settings.disableThumbnailProfileFrame)
+                    ? 'false'
+                    : 'true';
+            endpointUrl += `&includeBackground=${includeBackground}`;
+            endpointUrl += `&includeProfileFrame=${includeProfileFrame}`;
+        }
+
+        const response = await callRobloxApi({
+            subdomain: 'thumbnails',
+            endpoint: endpointUrl,
+            signal: signal,
+            noCache: noCache,
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            if (data && data.data) return data.data;
+        }
+    } catch (error) {
+        console.error(
+            `RoValra Thumbnails: Failed to fetch batch for "${type}".`,
+            error,
+        );
+    }
+
+    return results;
+}
+
+async function fetchThumbnailsDirect(
+    items,
+    type,
+    size = '150x150',
+    isCircular = false,
+    signal,
+) {
+    const thumbnailMap = new Map();
+    if (!items || items.length === 0) return thumbnailMap;
+
+    const processResults = (resultsArray) => {
+        resultsArray.flat().forEach((thumb) => {
+            thumb.thumbnailType = type;
+            if (type === 'PlayerToken') {
+                const token = thumb.requestId.split(':')[1];
+                thumbnailMap.set(token, thumb);
+            } else {
+                thumbnailMap.set(thumb.targetId, thumb);
+            }
+        });
+    };
+
+    const initialPromises = [];
+    for (let i = 0; i < items.length; i += BATCH_SIZE) {
+        const batch = items.slice(i, i + BATCH_SIZE);
+        initialPromises.push(
+            fetchBatchData(batch, type, size, isCircular, signal, false),
+        );
+    }
+
+    const initialResults = await Promise.all(initialPromises);
+    processResults(initialResults);
+
+    items.forEach((item) => {
+        const id = type === 'PlayerToken' ? item.id : Number(item.id);
+        if (!thumbnailMap.has(id)) {
+            thumbnailMap.set(id, {
+                targetId: id,
+                state: 'Blocked',
+                imageUrl: '',
+                thumbnailType: type,
+            });
+        }
+    });
+
+    const pendingItems = [];
+    const pendingResolvers = new Map();
+
+    for (const [id, data] of thumbnailMap.entries()) {
+        if (data.state === 'Blocked' && type === 'AvatarHeadshot') {
+            data.state = 'Pending';
+            data.finalUpdate = fetchUserThumbnailWithApiKey(id).then(
+                (updated) => {
+                    if (updated) Object.assign(data, updated);
+                    return updated;
+                },
+            );
+            continue;
+        }
+
+        if (data.state === 'Pending' || data.state === 'InReview') {
+            let resolver;
+            const updatePromise = new Promise((resolve) => {
+                resolver = resolve;
+            });
+
+            data.finalUpdate = updatePromise;
+
+            pendingItems.push({ id });
+            pendingResolvers.set(String(id), resolver);
+        }
+    }
+
+    if (pendingItems.length > 0) {
+        (async () => {
+            let currentPending = [...pendingItems];
+
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                if (currentPending.length === 0) break;
+                if (signal?.aborted) break;
+
+                await sleep(RETRY_DELAY_MS);
+                if (signal?.aborted) break;
+
+                const retryPromises = [];
+                for (let i = 0; i < currentPending.length; i += BATCH_SIZE) {
+                    const batch = currentPending.slice(i, i + BATCH_SIZE);
+                    retryPromises.push(
+                        fetchBatchData(
+                            batch,
+                            type,
+                            size,
+                            isCircular,
+                            signal,
+                            true,
+                        ),
+                    );
+                }
+
+                const retryResultsBatches = await Promise.all(retryPromises);
+                const flatResults = retryResultsBatches.flat();
+
+                const nextPending = [];
+
+                flatResults.forEach((thumb) => {
+                    let id;
+                    if (type === 'PlayerToken') {
+                        id = thumb.requestId.split(':')[1];
+                    } else {
+                        id = String(thumb.targetId);
+                    }
+
+                    if (thumb.state === 'Completed') {
+                        const resolve = pendingResolvers.get(id);
+                        if (resolve) {
+                            resolve(thumb);
+                            pendingResolvers.delete(id);
+                        }
+                    } else if (
+                        thumb.state === 'Pending' ||
+                        thumb.state === 'InReview'
+                    ) {
+                        nextPending.push({ id });
+                    } else {
+                        const resolve = pendingResolvers.get(id);
+                        if (resolve) {
+                            resolve(thumb);
+                            pendingResolvers.delete(id);
+                        }
+                    }
+                });
+
+                currentPending = nextPending;
+            }
+
+            currentPending.forEach((item) => {
+                const resolve = pendingResolvers.get(String(item.id));
+                if (resolve) resolve(null);
+            });
+        })();
+    }
+
+    return thumbnailMap;
+}
+
+export async function fetchThumbnails(
+    items,
+    type,
+    size = '150x150',
+    isCircular = false,
+    signal,
+) {
+    if (isCircular || signal) {
+        return fetchThumbnailsDirect(items, type, size, isCircular, signal);
+    }
+
+    const results = await Promise.all(
+        items.map((item) => getQueuedThumbnail(item.id, type, size)),
+    );
+
+    const thumbnailMap = new Map();
+    items.forEach((item, index) => {
+        const id = type === 'PlayerToken' ? item.id : Number(item.id);
+        thumbnailMap.set(id, results[index]);
+    });
+    return thumbnailMap;
+}
+
+export function createThumbnailElement(
+    thumbnailData,
+    altText,
+    baseClass = 'game-card-thumb',
+    style = { width: '100%', height: '100%' },
+) {
+    let thumbnailElement;
+    const state = thumbnailData ? thumbnailData.state : 'Error';
+
+    const isAvatar =
+        thumbnailData &&
+        (thumbnailData.thumbnailType === 'AvatarHeadshot' ||
+            thumbnailData.thumbnailType === 'PlayerToken');
+
+    const createCenteredIcon = (iconClass) => {
+        const container = document.createElement('div');
+        container.className = 'thumbnail-2d-container';
+        container.style.backgroundColor = 'var(--rovalra-icon-blocked-color)';
+        container.style.display = 'flex';
+        container.style.alignItems = 'center';
+        container.style.justifyContent = 'center';
+        container.style.borderRadius = isAvatar ? '50%' : '8px';
+
+        const icon = document.createElement('span');
+        icon.className = iconClass;
+        Object.assign(icon.style, {
+            width: '100%',
+            height: '100%',
+            display: 'inline-block',
+            backgroundRepeat: 'no-repeat',
+            backgroundPosition: 'center',
+            backgroundSize: 'contain',
+        });
+        container.appendChild(icon);
+        return applyStyles(container);
+    };
+    // Extra icons incase we need them later
+    // icon-pending, icon-unknown, icon-in-review
+
+    const applyStyles = (el) => {
+        el.alt = altText;
+        Object.assign(el.style, style);
+        return el;
+    };
+
+    const createImage = (imageUrl) => {
+        const image = document.createElement('img');
+        image.className = baseClass;
+        image.src = imageUrl;
+        image.onerror = () => {
+            if (image.parentNode) {
+                image.replaceWith(createCenteredIcon('icon-broken'));
+            }
+        };
+        return applyStyles(image);
+    };
+
+    if (state === 'Completed') {
+        return thumbnailData.imageUrl
+            ? createImage(thumbnailData.imageUrl)
+            : createCenteredIcon('icon-broken');
+    }
+
+    if (state === 'Blocked') {
+        return createCenteredIcon('icon-blocked');
+    }
+
+    if (state === 'Pending' || state === 'InReview') {
+        const container = document.createElement('div');
+        let className = 'thumbnail-2d-container shimmer';
+        if (
+            thumbnailData &&
+            (thumbnailData.thumbnailType === 'AvatarHeadshot' ||
+                thumbnailData.thumbnailType === 'PlayerToken')
+        ) {
+            className += ' icon-blocked';
+        }
+        container.className = className;
+        container.style.borderRadius = isAvatar ? '50%' : '8px';
+        applyStyles(container);
+
+        if (thumbnailData && thumbnailData.finalUpdate) {
+            thumbnailData.finalUpdate
+                .then((updatedData) => {
+                    if (!updatedData) {
+                        container.className =
+                            'thumbnail-2d-container icon-blocked';
+                        container.style.borderRadius = isAvatar ? '50%' : '8px';
+                        container.classList.remove('shimmer');
+                        return;
+                    }
+
+                    if (updatedData.state === 'Completed') {
+                        const img = createImage(updatedData.imageUrl);
+
+                        if (container.parentNode) {
+                            container.parentNode.replaceChild(img, container);
+                        }
+                    } else if (updatedData.state === 'Blocked') {
+                        container.style.display = 'flex';
+                        container.style.alignItems = 'center';
+                        container.style.justifyContent = 'center';
+                        container.style.backgroundColor = '#393b3d';
+                        container.innerHTML =
+                            '<span class="icon-blocked" style="width: 100%; height: 100%; display: inline-block; background-repeat: no-repeat; background-position: center; background-size: contain;"></span>';
+                        container.classList.remove('shimmer');
+                    } else {
+                        container.style.display = 'flex';
+                        container.style.alignItems = 'center';
+                        container.style.justifyContent = 'center';
+                        container.style.backgroundColor = '#393b3d';
+                        container.innerHTML =
+                            '<span class="icon-broken" style="width: 100%; height: 100%; display: inline-block; background-repeat: no-repeat; background-position: center; background-size: contain;"></span>';
+                        container.classList.remove('shimmer');
+                    }
+                })
+                .catch(() => {
+                    container.style.display = 'flex';
+                    container.style.alignItems = 'center';
+                    container.style.justifyContent = 'center';
+                    container.style.backgroundColor = '#393b3d';
+                    container.innerHTML =
+                        '<span class="icon-broken" style="width: 100%; height: 100%; display: inline-block; background-repeat: no-repeat; background-position: center; background-size: contain;"></span>';
+                    container.classList.remove('shimmer');
+                });
+        }
+
+        return container;
+    }
+
+    return createCenteredIcon('icon-broken');
+}
+
+export async function getBatchThumbnails(ids, type, size = '150x150') {
+    const items = ids.map((id) => ({ id }));
+    const thumbnailMap = await fetchThumbnails(items, type, size);
+    return ids.map((id) => {
+        const key = type === 'PlayerToken' ? String(id) : Number(id);
+        return (
+            thumbnailMap.get(key) || {
+                targetId: id,
+                state: 'Blocked',
+                imageUrl: '',
+                thumbnailType: type,
+            }
+        );
+    });
+}
+
+/**
+ * Generates a user thumbnail that works for banned users
+ *
+ * @param {string|number} userId
+ * @returns {Promise<Object>} Thumbnail data compatible with createThumbnailElement
+ */
+export async function fetchUserThumbnailWithApiKey(userId) {
+    try {
+        const response = await callRobloxApi({
+            subdomain: 'apis',
+            endpoint: `/cloud/v2/users/${userId}:generateThumbnail`,
+            method: 'GET',
+            useApiKey: true,
+            useBackground: true,
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            if (data.done && data.response?.imageUri) {
+                return {
+                    targetId: userId,
+                    state: 'Completed',
+                    imageUrl: data.response.imageUri,
+                    thumbnailType: 'AvatarHeadshot',
+                };
+            }
+        }
+    } catch (error) {
+        console.error(
+            `RoValra Thumbnails: Cloud generateThumbnail failed for ${userId}`,
+            error,
+        );
+    }
+    return {
+        targetId: userId,
+        state: 'Blocked',
+        imageUrl: '',
+        thumbnailType: 'AvatarHeadshot',
+    };
+}
+
+/**
+ * Allows you to render a custom avatar thumbnail.
+ * @param {string|number} userId
+ * @returns {Object}
+ */
+export function renderAvatarThumbnail(userId) {
+    const fetchRender = async () => {
+        try {
+            const avatarData = await getUserAvatar(userId);
+
+            const payload = {
+                thumbnailConfig: {
+                    thumbnailId: 1,
+                    thumbnailType: '2d',
+                    size: '420x420',
+                },
+                avatarDefinition: {
+                    assets: (avatarData.assets || []).map((a) => ({
+                        id: a.id,
+                        name: a.name,
+                        assetType: a.assetType,
+                        currentVersionId: a.currentVersionId,
+                    })),
+                    bodyColors: {
+                        headColor: avatarData.bodyColor3s.headColor3,
+                        torsoColor: avatarData.bodyColor3s.torsoColor3,
+                        rightArmColor: avatarData.bodyColor3s.rightArmColor3,
+                        leftArmColor: avatarData.bodyColor3s.leftArmColor3,
+                        rightLegColor: avatarData.bodyColor3s.rightLegColor3,
+                        leftLegColor: avatarData.bodyColor3s.leftLegColor3,
+                    },
+                    scales: avatarData.scales,
+                    playerAvatarType: {
+                        playerAvatarType: avatarData.playerAvatarType,
+                    },
+                },
+            };
+
+            const renderRes = await callRobloxApi({
+                subdomain: 'avatar',
+                endpoint: '/v1/avatar/render',
+                method: 'POST',
+                body: payload,
+            });
+
+            if (renderRes.ok) {
+                const data = await renderRes.json();
+                if (data && data.imageUrl) {
+                    return {
+                        state: 'Completed',
+                        imageUrl: data.imageUrl,
+                        thumbnailType: 'Avatar',
+                    };
+                }
+            }
+        } catch (e) {
+            console.error(
+                `RoValra Thumbnails: Avatar render fallback failed for ${userId}`,
+                e,
+            );
+        }
+        return null;
+    };
+
+    return {
+        state: 'Pending',
+        thumbnailType: 'Avatar',
+        finalUpdate: fetchRender(),
+    };
+}
+
+export async function fetchPromotionalThumbnails(universeId) {
+    try {
+        const response = await callRobloxApi({
+            subdomain: 'thumbnails',
+            endpoint: `/v1/games/multiget/thumbnails?universeIds=${universeId}&countPerUniverse=100&defaults=true&size=768x432&format=Png&isCircular=false`,
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            const thumbnails = data.data?.[0]?.thumbnails || [];
+            thumbnails.forEach((t) => (t.thumbnailType = 'GameThumbnail'));
+            return thumbnails;
+        }
+    } catch (e) {
+        console.error('RoValra Thumbnails: Promotional fetch failed', e);
+    }
+    return [];
+}
+
+const thumbQueue = new Map();
+let thumbTimer = null;
+
+async function flushThumbQueue() {
+    const currentQueues = Array.from(thumbQueue.entries());
+    thumbQueue.clear();
+    thumbTimer = null;
+
+    await Promise.all(
+        currentQueues.map(async ([key, queueMap]) => {
+            const [type, size] = key.split(':');
+            const ids = Array.from(queueMap.keys());
+            if (ids.length === 0) return;
+
+            try {
+                const thumbMap = await fetchThumbnailsDirect(
+                    ids.map((id) => ({ id })),
+                    type,
+                    size,
+                );
+                ids.forEach((id) => {
+                    const resolvers = queueMap.get(id);
+                    const result = thumbMap.get(id);
+                    resolvers.forEach((res) => res(result));
+                });
+            } catch (e) {
+                ids.forEach((id) =>
+                    queueMap.get(id).forEach((res) => res(null)),
+                );
+            }
+        }),
+    );
+}
+
+export function getQueuedThumbnail(id, type, size = '150x150') {
+    return new Promise((resolve) => {
+        const normalizedId = type === 'PlayerToken' ? id : Number(id);
+        const key = `${type}:${size}`;
+        if (!thumbQueue.has(key)) thumbQueue.set(key, new Map());
+        const typeQueue = thumbQueue.get(key);
+
+        if (!typeQueue.has(normalizedId)) typeQueue.set(normalizedId, []);
+        typeQueue.get(normalizedId).push(resolve);
+
+        if (!thumbTimer) thumbTimer = setTimeout(flushThumbQueue, 50);
+    });
+}

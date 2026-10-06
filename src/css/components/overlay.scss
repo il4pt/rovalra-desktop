@@ -1,0 +1,196 @@
+.rovalra-global-overlay {
+    position: fixed !important;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 0, 0, 0.6);
+    pointer-events: auto;
+    z-index: 10000 !important;
+    transform: none;
+
+    // Theme variables
+    --rovalra-overlay-bg: var(--color-surface-100, #ffffff);
+    --rovalra-overlay-text: var(--color-content-emphasis, #191b1d);
+    --rovalra-overlay-border: var(--color-surface-100, #d9dadb);
+    --rovalra-overlay-shadow: rgba(0, 0, 0, 0.15);
+
+    body.dark-theme & {
+        --rovalra-overlay-shadow: rgba(0, 0, 0, 0.5);
+    }
+}
+
+.rovalra-overlay-content {
+    position: relative;
+    border-radius: 12px;
+    background-color: var(--rovalra-overlay-bg);
+    color: var(--rovalra-overlay-text);
+    border: 1px solid var(--rovalra-overlay-border);
+    box-shadow: 0 8px 16px var(--rovalra-overlay-shadow);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    max-height: 90vh;
+    max-width: 90vw;
+    width: 90%;
+    pointer-events: auto;
+}
+
+.rovalra-overlay-body {
+    padding: 0 24px;
+    display: block;
+    overflow-y: auto;
+    flex-grow: 1;
+    min-height: 0;
+    width: 100%;
+    box-sizing: border-box;
+    overflow-x: hidden;
+    overflow-wrap: break-word;
+    word-wrap: break-word;
+    word-break: break-word;
+}
+
+.rovalra-overlay-body .setting-controls {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+
+.rovalra-overlay-body .setting-controls > label {
+    flex: 0 0 150px;
+    font-size: 16px;
+    line-height: 1.3;
+}
+
+.rovalra-overlay-body .rovalra-profile-badges-editor {
+    padding: 8px 0 16px;
+}
+
+.rovalra-overlay-body .rovalra-profile-badge-setting .setting-controls {
+    position: relative;
+    width: 100%;
+    align-items: center;
+    flex-wrap: nowrap;
+    justify-content: center;
+    min-height: 42px;
+    padding: 6px 0;
+}
+
+.rovalra-overlay-body
+    .rovalra-profile-badge-setting
+    .setting-controls
+    > label {
+    flex: 1 1 100%;
+    min-width: 0;
+    padding: 0 56px;
+    text-align: center;
+    font-weight: 600;
+}
+
+.rovalra-overlay-body
+    .rovalra-profile-badge-setting
+    .setting-controls
+    > .btn-toggle {
+    position: absolute;
+    right: 0;
+}
+
+.rovalra-overlay-body
+    .rovalra-profile-badges-master-setting
+    .setting-controls
+    > label {
+    padding-left: 0;
+    text-align: left;
+}
+
+.rovalra-overlay-body
+    .rovalra-profile-pronouns-editor
+    .setting-controls
+    > label {
+    align-self: center;
+    font-weight: 700;
+}
+
+.rovalra-overlay-body .setting-description {
+    max-width: 100%;
+    margin: 12px 0;
+    line-height: 1.55;
+    white-space: pre-line;
+}
+
+.rovalra-overlay-header {
+    display: flex;
+    align-items: center;
+    font-size: 20px;
+    font-weight: 700;
+    flex-shrink: 0;
+    line-height: 1.3;
+    padding: 24px 48px 16px 24px;
+}
+
+.rovalra-overlay-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    flex-shrink: 0;
+    margin-top: auto;
+    padding: 16px 24px 24px;
+}
+
+.rovalra-overlay-close {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 10;
+}
+
+.rovalra-friend-ownership-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.rovalra-friend-ownership-row {
+    min-height: 70px;
+    padding: 4px 0;
+}
+
+.rovalra-friend-ownership-profile-link {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    min-height: 70px;
+    color: inherit;
+    text-decoration: none;
+}
+
+.rovalra-friend-ownership-thumbnail {
+    width: 70px !important;
+    height: 70px !important;
+    flex-shrink: 0;
+    border-radius: 50%;
+    overflow: hidden;
+    object-fit: cover;
+}
+
+.rovalra-friend-ownership-names {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.rovalra-friend-ownership-names span:first-child {
+    display: inline-flex;
+    align-items: center;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.rovalra-friend-ownership-names span:last-child {
+    color: var(--rovalra-secondary-text-color, #6e6e6e);
+    font-size: 13px;
+}

@@ -1,0 +1,663 @@
+import { observeChildren, observeElement } from '../../core/observer.js';
+import { getUserIdFromUrl } from '../../core/idExtractor.js';
+import { createButton } from '../../core/ui/buttons.js';
+import { createDropdown } from '../../core/ui/dropdown.js';
+import { createToggle } from '../../core/ui/general/toggle.js';
+import { createShimmerGrid } from '../../core/ui/shimmer.js';
+import { createOverlay } from '../../core/ui/overlay.js';
+import { fetchThumbnails as fetchThumbnailsBatch } from '../../core/thumbnail/thumbnails.js';
+import { callRobloxApi } from '../../core/api.js';
+import { safeHtml } from '../../core/packages/dompurify';
+import { createGameCard } from '../../core/ui/games/gameCard.js';
+import { t } from '../../core/locale/i18n.js';
+import { settings } from '../../core/settings/getSettings.js';
+const CONFIG = {
+    PAGE_SIZE: 50,
+    ACCESS_FILTER: { PUBLIC: 2 },
+    RETRY: {
+        MAX_ATTEMPTS: 5,
+        DELAY_MS: 3000,
+    },
+};
+
+const ENDPOINTS = {
+    INVENTORY_CHECK: (userId) => `/v1/users/${userId}/can-view-inventory`,
+
+    INVENTORY_GAMES: (userId, cursor = '') =>
+        `/v1/users/${userId}/places/inventory?cursor=${cursor}&itemsPerPage=100&placesTab=Created`,
+
+    GAMES_V2: (userId, accessFilter, cursor = '') =>
+        `/v2/users/${userId}/games?accessFilter=${accessFilter}&limit=50&sortOrder=Asc&cursor=${cursor}`,
+
+    VOTES_V1: (ids) => `/v1/games/votes?universeIds=${ids}`,
+    GAMES_V1: (ids) => `/v1/games?universeIds=${ids}`,
+};
+
+const userListCache = new Map();
+const sharedStatsCache = {
+    likes: new Map(),
+    players: new Map(),
+    updated: new Map(),
+    thumbnails: new Map(),
+};
+
+const Api = {
+    async fetchWithRetry(options) {
+        let delay = CONFIG.RETRY.DELAY_MS;
+
+        for (let i = 0; i <= CONFIG.RETRY.MAX_ATTEMPTS; i++) {
+            try {
+                const response = await callRobloxApi(options);
+
+                if (response.status === 429) {
+                    if (i === CONFIG.RETRY.MAX_ATTEMPTS)
+                        throw new Error('Rate limit exceeded');
+                    await new Promise((r) => setTimeout(r, delay));
+                    delay *= 2;
+                    continue;
+                }
+
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return response;
+            } catch (err) {
+                if (i >= CONFIG.RETRY.MAX_ATTEMPTS) return null;
+                await new Promise((r) => setTimeout(r, delay));
+                delay *= 2;
+            }
+        }
+        return null;
+    },
+
+    async checkInventoryPublic(userId) {
+        const res = await this.fetchWithRetry({
+            subdomain: 'inventory',
+            endpoint: ENDPOINTS.INVENTORY_CHECK(userId),
+        });
+        const data = res ? await res.json().catch(() => null) : null;
+        return data?.canView === true;
+    },
+
+    async getAllOwnedUniverses(userId) {
+        const itemByUniverse = new Map();
+        let nextCursor = '';
+
+        do {
+            const res = await this.fetchWithRetry({
+                subdomain: 'inventory',
+                endpoint: ENDPOINTS.INVENTORY_GAMES(userId, nextCursor),
+            });
+            const data = res ? await res.json().catch(() => null) : null;
+
+            if (data?.data) {
+                for (const item of data.data) {
+                    if (
+                        item.universeId != null &&
+                        !itemByUniverse.has(item.universeId)
+                    ) {
+                        itemByUniverse.set(item.universeId, item);
+                    }
+                }
+                nextCursor = data.nextPageCursor;
+            } else {
+                nextCursor = null;
+            }
+        } while (nextCursor);
+
+        return itemByUniverse;
+    },
+
+    async getPublicGames(userId) {
+        let games = [];
+        let nextCursor = null;
+
+        do {
+            const endpoint = ENDPOINTS.GAMES_V2(
+                userId,
+                CONFIG.ACCESS_FILTER.PUBLIC,
+                nextCursor || '',
+            );
+
+            const res = await this.fetchWithRetry({
+                subdomain: 'games',
+                endpoint: endpoint,
+            });
+            const data = res ? await res.json().catch(() => null) : null;
+
+            if (data?.data) {
+                const formattedGames = data.data.filter(
+                    (item) => item.id != null,
+                );
+                games = games.concat(formattedGames);
+                nextCursor = data.nextPageCursor;
+            } else {
+                nextCursor = null;
+            }
+        } while (nextCursor);
+
+        return games;
+    },
+
+    async resolveGameInfo(universeIds, itemByUniverse) {
+        const gameById = new Map();
+        for (let i = 0; i < universeIds.length; i += 50) {
+            const chunk = universeIds.slice(i, i + 50);
+            const res = await this.fetchWithRetry({
+                subdomain: 'games',
+                endpoint: ENDPOINTS.GAMES_V1(chunk.join(',')),
+            });
+            const data = res ? await res.json().catch(() => null) : null;
+            data?.data?.forEach((g) => gameById.set(g.id, g));
+        }
+
+        return universeIds.map((id) => {
+            const info = gameById.get(id);
+            const fallback = itemByUniverse.get(id);
+            return {
+                id,
+                name: info?.name || fallback.name,
+                rootPlaceId: info?.rootPlaceId || fallback.placeId,
+            };
+        });
+    },
+
+    async getUserGames(userId) {
+        if (userListCache.has(userId)) {
+            return userListCache.get(userId).catch((err) => {
+                console.error(err);
+                return { all: [], hidden: [] };
+            });
+        }
+
+        const fetchPromise = (async () => {
+            const isPublic = await this.checkInventoryPublic(userId);
+            if (!isPublic) return { all: [], hidden: [] };
+
+            const [itemByUniverse, publicGames] = await Promise.all([
+                this.getAllOwnedUniverses(userId),
+                this.getPublicGames(userId),
+            ]);
+
+            const publicIds = new Set(publicGames.map((g) => g.id));
+            const allIds = [...itemByUniverse.keys()];
+            const all = await this.resolveGameInfo(allIds, itemByUniverse);
+            const hidden = all.filter((g) => !publicIds.has(g.id));
+
+            return { all, hidden };
+        })();
+
+        userListCache.set(userId, fetchPromise);
+        fetchPromise.catch(() => userListCache.delete(userId));
+        return fetchPromise.catch(
+            (err) => (console.error(err), { all: [], hidden: [] }),
+        );
+    },
+
+    async enrichGameData(games, state) {
+        const batch = games.filter(
+            (g) => g && (!state.likes.has(g.id) || !state.updated.has(g.id)),
+        );
+        if (!batch.length) return;
+
+        const playerResList = [];
+        const voteResList = [];
+        for (let i = 0; i < batch.length; i += 50) {
+            const chunk = batch.slice(i, i + 50);
+            const chunkIds = chunk.map((g) => g.id).join(',');
+
+            if (i > 0) await new Promise((r) => setTimeout(r, 250));
+
+            const [gamesRes, votesRes] = await Promise.all([
+                this.fetchWithRetry({
+                    subdomain: 'games',
+                    endpoint: ENDPOINTS.GAMES_V1(chunkIds),
+                }).then((r) => r?.json()),
+                this.fetchWithRetry({
+                    subdomain: 'games',
+                    endpoint: ENDPOINTS.VOTES_V1(chunkIds),
+                }).then((r) => r?.json()),
+            ]);
+
+            playerResList.push(gamesRes);
+            voteResList.push(votesRes);
+        }
+
+        voteResList.forEach((likeRes) => {
+            if (likeRes?.data) {
+                likeRes.data.forEach((item) => {
+                    const total = item.upVotes + item.downVotes;
+                    const ratio =
+                        total > 0
+                            ? Math.round((item.upVotes / total) * 100)
+                            : 0;
+                    state.likes.set(item.id, {
+                        ratio,
+                        total,
+                        upVotes: item.upVotes,
+                        downVotes: item.downVotes,
+                    });
+                });
+            }
+        });
+
+        playerResList.forEach((playerRes) => {
+            if (playerRes?.data) {
+                playerRes.data.forEach((item) => {
+                    state.players.set(item.id, item.playing || 0);
+                    state.updated.set(item.id, item.updated || 0);
+                });
+            }
+        });
+
+        const newThumbnails = await fetchThumbnailsBatch(
+            batch,
+            'GameIcon',
+            '256x256',
+        );
+        newThumbnails.forEach((data, id) => state.thumbnails.set(id, data));
+    },
+};
+
+const UI = {
+    async createFilterPanel(onFilterChange) {
+        const container = document.createElement('div');
+        container.className = 'rovalra-filters-container';
+
+        const createFilterSection = (label, element) => {
+            const div = document.createElement('div');
+            div.className = 'rovalra-filter-section';
+            div.innerHTML = safeHtml`<label>${label}</label>`;
+            div.appendChild(element);
+            return div;
+        };
+
+        const sortDropdown = createDropdown({
+            items: [
+                {
+                    value: 'default',
+                    label: await t('hiddenGamesProfile.sort.default'),
+                },
+                {
+                    value: 'like-ratio',
+                    label: await t('hiddenGamesProfile.sort.likeRatio'),
+                },
+                {
+                    value: 'likes',
+                    label: await t('hiddenGamesProfile.sort.likes'),
+                },
+                {
+                    value: 'dislikes',
+                    label: await t('hiddenGamesProfile.sort.dislikes'),
+                },
+                {
+                    value: 'players',
+                    label: await t('hiddenGamesProfile.sort.players'),
+                },
+                {
+                    value: 'name',
+                    label: await t('hiddenGamesProfile.sort.name'),
+                },
+            ],
+            initialValue: 'default',
+            onValueChange: (v) => onFilterChange('sort', v),
+        });
+
+        const orderDropdown = createDropdown({
+            items: [
+                {
+                    value: 'desc',
+                    label: await t('hiddenGamesProfile.order.descending'),
+                },
+                {
+                    value: 'asc',
+                    label: await t('hiddenGamesProfile.order.ascending'),
+                },
+            ],
+            initialValue: 'desc',
+            onValueChange: (v) => onFilterChange('order', v),
+        });
+
+        const showAllToggle = createToggle({
+            checked: false,
+            onChange: (v) => onFilterChange('showAll', v),
+        });
+        showAllToggle.style.transform = 'scale(1.3)';
+        showAllToggle.style.transformOrigin = 'left center';
+
+        const showAllToggleWrapper = document.createElement('div');
+        showAllToggleWrapper.style.display = 'flex';
+        showAllToggleWrapper.style.alignItems = 'center';
+        showAllToggleWrapper.style.minHeight = '38px';
+        showAllToggleWrapper.appendChild(showAllToggle);
+
+        container.append(
+            createFilterSection(
+                await t('hiddenGamesProfile.labels.sort'),
+                sortDropdown.element,
+            ),
+            createFilterSection(
+                await t('hiddenGamesProfile.labels.order'),
+                orderDropdown.element,
+            ),
+            createFilterSection(
+                await t('hiddenGamesProfile.labels.showAll'),
+                showAllToggleWrapper,
+            ),
+        );
+
+        return container;
+    },
+
+    async injectButton(header, onClick) {
+        if (!header || header.querySelector('.rovalra-hidden-games-button'))
+            return;
+
+        if (
+            header.querySelector('social-link-icon-list') ||
+            header.querySelector('h2')
+        )
+            return;
+
+        const btn = createButton(
+            await t('hiddenGamesProfile.buttonText'),
+            'secondary',
+        );
+        btn.classList.add('rovalra-hidden-games-button');
+        btn.style.marginLeft = '5px';
+        btn.addEventListener('click', onClick);
+        const buttonContainer = header.querySelector('.container-buttons');
+        if (buttonContainer) {
+            header.insertBefore(btn, buttonContainer);
+        } else {
+            header.appendChild(btn);
+        }
+    },
+
+    async createEmptyState(onClick) {
+        const container = document.createElement('div');
+        container.className = 'rovalra-empty-state section';
+
+        const text = document.createElement('p');
+        text.className = 'text-label';
+        text.textContent = await t('hiddenGamesProfile.noPublicGames');
+
+        const btn = createButton(
+            await t('hiddenGamesProfile.buttonText'),
+            'secondary',
+        );
+        btn.classList.add('rovalra-hidden-games-button');
+        btn.addEventListener('click', onClick);
+
+        container.append(text, btn);
+        return container;
+    },
+};
+
+class HiddenGamesManager {
+    constructor(userId) {
+        this.userId = userId;
+        this.ownedGames = [];
+        this.hiddenGames = [];
+        this.showAllGames = false;
+        this.cache = sharedStatsCache;
+        this.filters = { sort: 'default', order: 'desc' };
+        this.processedGames = [];
+        this.visibleCount = 0;
+        this.isLoading = false;
+        this.elements = {};
+    }
+
+    async openOverlay() {
+        const body = document.createElement('div');
+
+        const list = document.createElement('div');
+        list.className = 'rovalra-hidden-games-list';
+        list.appendChild(
+            createShimmerGrid(12, { width: '150px', height: '240px' }),
+        );
+
+        const loader = document.createElement('div');
+        loader.className = 'rovalra-load-more-container';
+        loader.classList.add('rovalra-hidden-games-list');
+        loader.style.paddingTop = '0';
+
+        body.append(list, loader);
+
+        this.elements = { list, loader };
+
+        const { overlay } = createOverlay({
+            title: await t('hiddenGamesProfile.overlayText'),
+            bodyContent: body,
+            maxWidth: '1200px',
+            maxHeight: '85vh',
+        });
+
+        const { all, hidden } = await Api.getUserGames(this.userId);
+        this.ownedGames = all;
+        this.hiddenGames = hidden;
+
+        if (!this.ownedGames || this.ownedGames.length === 0) {
+            this.elements.list.innerHTML = safeHtml`<p class="rovalra-no-hidden-games-message">${await t('hiddenGamesProfile.noHiddenGames')}</p>`;
+            return;
+        }
+
+        const filterPanel = await UI.createFilterPanel(
+            this.handleFilterChange.bind(this),
+        );
+        body.prepend(filterPanel);
+        this.elements.filterPanel = filterPanel;
+
+        const scrollContainer = overlay.querySelector('.rovalra-overlay-body');
+        if (scrollContainer) {
+            scrollContainer.addEventListener('scroll', () => {
+                const { scrollTop, clientHeight, scrollHeight } =
+                    scrollContainer;
+                if (scrollTop + clientHeight >= scrollHeight - 150) {
+                    this.loadMore();
+                }
+            });
+        }
+
+        this.applyFilters();
+    }
+
+    handleFilterChange(key, value) {
+        if (key === 'showAll') {
+            this.showAllGames = value;
+        } else {
+            this.filters[key] = value;
+        }
+        this.applyFilters();
+    }
+
+    async applyFilters() {
+        if (this.isLoading) return;
+        this.isLoading = true;
+
+        this.elements.list.innerHTML = '';
+        this.elements.list.appendChild(
+            createShimmerGrid(12, { width: '150px', height: '240px' }),
+        );
+        this.visibleCount = 0;
+
+        const source = this.showAllGames ? this.ownedGames : this.hiddenGames;
+
+        if (
+            ['default', 'like-ratio', 'likes', 'dislikes', 'players'].includes(
+                this.filters.sort,
+            )
+        ) {
+            await Api.enrichGameData(source, this.cache);
+        }
+
+        const { sort, order } = this.filters;
+        const orderMultiplier = order === 'desc' ? -1 : 1;
+        let sorted = [...source];
+
+        if (sort === 'default') {
+            sorted.sort(
+                (a, b) =>
+                    (new Date(this.cache.updated.get(a.id) || 0).getTime() -
+                        new Date(this.cache.updated.get(b.id) || 0).getTime()) *
+                    orderMultiplier,
+            );
+        } else if (sort === 'like-ratio') {
+            sorted.sort(
+                (a, b) =>
+                    ((this.cache.likes.get(a.id)?.ratio || 0) -
+                        (this.cache.likes.get(b.id)?.ratio || 0)) *
+                    orderMultiplier,
+            );
+        } else if (sort === 'likes') {
+            sorted.sort(
+                (a, b) =>
+                    ((this.cache.likes.get(a.id)?.upVotes || 0) -
+                        (this.cache.likes.get(b.id)?.upVotes || 0)) *
+                    orderMultiplier,
+            );
+        } else if (sort === 'dislikes') {
+            sorted.sort(
+                (a, b) =>
+                    ((this.cache.likes.get(a.id)?.downVotes || 0) -
+                        (this.cache.likes.get(b.id)?.downVotes || 0)) *
+                    orderMultiplier,
+            );
+        } else if (sort === 'players') {
+            sorted.sort(
+                (a, b) =>
+                    ((this.cache.players.get(a.id) || 0) -
+                        (this.cache.players.get(b.id) || 0)) *
+                    orderMultiplier,
+            );
+        } else if (sort === 'name') {
+            sorted.sort(
+                (a, b) => a.name.localeCompare(b.name) * orderMultiplier,
+            );
+        } else {
+            if (order === 'asc') {
+                sorted.reverse();
+            }
+        }
+
+        this.processedGames = sorted;
+        this.isLoading = false;
+
+        this.elements.list.innerHTML = '';
+        if (this.processedGames.length === 0) {
+            const emptyKey =
+                !this.showAllGames && source.length === 0
+                    ? 'hiddenGamesProfile.noHiddenGames'
+                    : 'hiddenGamesProfile.noMatches';
+            this.elements.list.innerHTML = safeHtml`<p class="rovalra-no-hidden-games-message">${await t(emptyKey)}</p>`;
+        } else {
+            await this.loadMore();
+        }
+    }
+
+    async loadMore() {
+        if (
+            this.visibleCount >= this.processedGames.length ||
+            this.elements.loader.innerHTML !== ''
+        )
+            return;
+
+        this.elements.loader.appendChild(
+            createShimmerGrid(12, { width: '150px', height: '240px' }),
+        );
+
+        try {
+            const nextBatch = this.processedGames.slice(
+                this.visibleCount,
+                this.visibleCount + CONFIG.PAGE_SIZE,
+            );
+
+            if (nextBatch.length > 0) {
+                await Api.enrichGameData(nextBatch, this.cache);
+                nextBatch.forEach((game) => {
+                    this.elements.list.appendChild(
+                        createGameCard({ game, stats: this.cache }),
+                    );
+                });
+                this.visibleCount += nextBatch.length;
+            }
+        } catch (err) {
+            console.warn('RoValra: Error loading more games', err);
+        } finally {
+            this.elements.loader.innerHTML = '';
+        }
+    }
+}
+
+let isInitialized = false;
+export async function init() {
+    if (isInitialized) return;
+    if ((await settings.userGamesEnabled) !== true) return;
+    isInitialized = true;
+
+    const handleButtonClick = () => {
+        const userId = getUserIdFromUrl();
+        if (!userId) return;
+        new HiddenGamesManager(userId).openOverlay();
+    };
+
+    observeElement(
+        '.profile-experiences.profile-game .container-header, .btr-profile-right .profile-game .container-header, .placeholder-games .container-header',
+        (header) => {
+            if (header.dataset.rovalraProcessed) return;
+            header.dataset.rovalraProcessed = 'true';
+            UI.injectButton(header, handleButtonClick);
+        },
+        { multiple: true },
+    );
+
+    const isBlank = (content) =>
+        [...content.children].every(
+            (child) =>
+                child.tagName === 'DIV' &&
+                child.children.length === 0 &&
+                child.textContent.trim() === '',
+        );
+
+    let isCheckingEmptyState = false;
+    const checkEmptyState = async () => {
+        if (isCheckingEmptyState) return;
+        if (!window.location.hash.includes('creations')) return;
+        isCheckingEmptyState = true;
+
+        try {
+            const contents = document.querySelectorAll('.profile-tab-content');
+            for (const content of contents) {
+                if (
+                    content.classList.contains('ng-hide') ||
+                    content.classList.contains('hidden')
+                )
+                    continue;
+                if (content.querySelector('.rovalra-empty-state')) continue;
+                if (!isBlank(content)) continue;
+
+                await new Promise((resolve) => setTimeout(resolve, 1500));
+                if (
+                    content.querySelector('.rovalra-empty-state') ||
+                    !isBlank(content)
+                )
+                    continue;
+
+                content.innerHTML = '';
+                content.appendChild(
+                    await UI.createEmptyState(handleButtonClick),
+                );
+            }
+        } finally {
+            isCheckingEmptyState = false;
+        }
+    };
+
+    window.addEventListener('hashchange', checkEmptyState);
+    observeElement(
+        '.profile-tab-content',
+        (content) => {
+            checkEmptyState();
+            observeChildren(content, checkEmptyState);
+        },
+        { multiple: true },
+    );
+}

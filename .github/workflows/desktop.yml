@@ -1,0 +1,35 @@
+name: Build Desktop App
+
+on:
+    workflow_dispatch:
+    push:
+        tags:
+            - 'desktop-v*'
+
+jobs:
+    build:
+        strategy:
+            matrix:
+                include:
+                    - os: ubuntu-latest
+                      target: --linux
+                    - os: windows-latest
+                      target: --win
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: '22'
+            - name: Build extension
+              run: npm ci && npm run build
+            - name: Build desktop app
+              working-directory: desktop
+              run: npm ci && node prepare-extension.js && node pack.js ${{ matrix.target }}
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: rovalra-desktop-${{ runner.os }}
+                  path: |
+                      desktop/release/*.AppImage
+                      desktop/release/*.tar.gz
+                      desktop/release/*.exe

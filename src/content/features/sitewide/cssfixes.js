@@ -1,0 +1,366 @@
+import { observeElement, observeResize } from '../../core/observer.js';
+import { getPlaceIdFromUrl } from '../../core/idExtractor.js';
+import { getAuthenticatedUserId } from '../../core/user.js';
+
+const applyImpersonateAttribute = (headerContainer) => {
+    chrome.storage.local.get('impersonateRobloxStaffSetting', function (data) {
+        if (data.impersonateRobloxStaffSetting) {
+            headerContainer.setAttribute('data-mayimpersonate', 'true');
+        }
+    });
+};
+
+const applyHeaderFix = (profileHeader) => {
+    if (profileHeader.dataset.headerFixApplied) return;
+    profileHeader.dataset.headerFixApplied = 'true';
+
+    const headerNames = profileHeader.querySelector('.profile-header-names');
+    const headerDetails = profileHeader.querySelector(
+        '.profile-header-details',
+    );
+    const headerMain = profileHeader.querySelector('.profile-header-main');
+    const headerButtons = profileHeader.querySelector(
+        '.profile-header-buttons',
+    );
+    const headerMisc = profileHeader.querySelector('.header-misc');
+
+    if (headerNames && headerDetails && headerMain && headerButtons) {
+        if (headerNames.parentElement !== headerMain) {
+            headerMain.insertBefore(headerNames, headerButtons);
+        }
+
+        if (headerMisc) {
+            headerNames.appendChild(headerMisc);
+        }
+
+        if (headerDetails.parentElement !== profileHeader) {
+            profileHeader.appendChild(headerDetails);
+        }
+        const css = `
+            .profile-avatar-thumb { width: 128px !important; height: 128px !important; }
+            .profile-header-main { margin-bottom: 0 !important; }
+            .profile-header-details { padding: 0 !important; padding-bottom: 24px !important; }
+            .profile-header-social-counts { padding-left: 167px; box-sizing: border-box; }
+            .profile-header-names { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+            .header-misc { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+            @media (max-width: 768px) { .profile-header-social-counts { padding-left: 0; } }
+        `;
+        const style = document.createElement('style');
+        style.textContent = css;
+        document.head.appendChild(style);
+
+        console.log('CSS Fixer: Header fix applied successfully.');
+    }
+};
+
+const applyHomeHeaderLinkFix = () => {
+    chrome.storage.local.get('giantInvisibleLink', function (settings) {
+        if (
+            !settings.giantInvisibleLink ||
+            window.location.pathname !== '/home'
+        ) {
+            return;
+        }
+
+        const selector =
+            'a[data-testid="section-header-title-subtitle-container"]';
+
+        observeElement(
+            selector,
+            (anchor) => {
+                if (anchor.dataset.rovalraLinkFixApplied) return;
+                anchor.dataset.rovalraLinkFixApplied = 'true';
+
+                const innerDiv = anchor.querySelector(
+                    'div[data-testid="text-icon-row"]',
+                );
+                if (!innerDiv) return;
+
+                const newAnchor = document.createElement('a');
+                newAnchor.href = anchor.href;
+                newAnchor.className = 'css-j5e4nw-textIconRow';
+                newAnchor.setAttribute(
+                    'aria-label',
+                    anchor.getAttribute('aria-label'),
+                );
+                newAnchor.style.display = 'inline-flex';
+                newAnchor.style.width = 'fit-content';
+                newAnchor.style.minWidth = 'fit-content';
+
+                while (innerDiv.firstChild) {
+                    newAnchor.appendChild(innerDiv.firstChild);
+                }
+
+                anchor.replaceWith(newAnchor);
+            },
+            { multiple: true },
+        );
+    });
+};
+
+const applyGameTitleFix = () => {
+    chrome.storage.local.get('gameTitleIssueEnable', function (settings) {
+        if (!settings.gameTitleIssueEnable) return;
+
+        if (!window.location.href.includes('profile')) return;
+
+        const css = `
+            .slide-item-name.games.font-title {
+                line-height: normal !important;
+            }
+        `;
+        const style = document.createElement('style');
+        style.textContent = css;
+        (document.head || document.documentElement).appendChild(style);
+    });
+};
+
+const applyProfileUsernameSpacingFix = (enabled) => {
+    if (!enabled) return;
+
+    const styleId = 'rovalra-profile-username-spacing-fix';
+    if (document.getElementById(styleId)) return;
+
+    const style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+        .user-profile-header-info > .flex.gap-medium.items-center.min-width-0 > .flex.flex-col.min-width-0 {
+            align-self: stretch;
+            box-sizing: border-box;
+            padding-block: 20px;
+        }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+};
+
+const applyCartRemoveButtonFix = () => {
+    chrome.storage.local.get('FixCartRemoveButton', function (settings) {
+        if (!settings.FixCartRemoveButton) return;
+
+        const css = `
+            .cart-item-container .rm-item-btn-container.icon-actions-clear-sm button {
+                width: 18px;
+                height: 18px;
+            }
+        `;
+        const style = document.createElement('style');
+        style.textContent = css;
+        (document.head || document.documentElement).appendChild(style);
+    });
+};
+
+const applyProfileGameCardFix = () => {
+    if (!window.location.href.includes('profile')) return;
+
+    const css = `
+        .profile-favorite-experiences .css-1jynqc0-carouselContainer,
+        .profile-favorite-experiences .css-1i465w8-carousel {
+            height: 250px !important;
+            overflow: visible !important;
+        }
+    `;
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+
+    import('../../core/ui/games/gameCard.js').then(({ createGameCard }) => {
+        observeElement(
+            '.profile-favorite-experiences .game-card-container',
+            (originalCard) => {
+                if (originalCard.dataset.fixed) return;
+                originalCard.dataset.fixed = 'true';
+
+                try {
+                    const link = originalCard.querySelector('.game-card-link');
+                    if (!link) return;
+
+                    const universeId = link.id || link.dataset.universeId;
+                    const placeId = getPlaceIdFromUrl(link.href);
+
+                    if (!universeId && !placeId) return;
+
+                    const newCard = universeId
+                        ? createGameCard({ gameId: universeId })
+                        : createGameCard({ placeId: placeId });
+                    originalCard.innerHTML = '';
+                    originalCard.appendChild(newCard);
+                } catch (e) {
+                    console.warn(
+                        'RoValra: Failed to replace profile game card',
+                        e,
+                    );
+                }
+            },
+            { multiple: true },
+        );
+    });
+};
+
+// Cuz RoSeal is broken and im the only one having this issue i have to fix it myself 🙄
+const applyFriendsCarouselPaddingFix = async () => {
+    const userId = await getAuthenticatedUserId();
+
+    if (userId !== 447170745) return;
+
+    observeElement(
+        '.react-friends-carousel-container.roseal-friends-carousel-container',
+        () => {
+            const css = `
+            .friends-carousel-container {
+                padding: 0 !important;
+            }
+        `;
+            const style = document.createElement('style');
+            style.setAttribute('data-rovalra-friends-carousel-fix', 'true');
+            style.textContent = css;
+
+            if (
+                !document.querySelector(
+                    'style[data-rovalra-friends-carousel-fix]',
+                )
+            ) {
+                document.head.appendChild(style);
+            }
+        },
+    );
+};
+
+const applyNotificationBellMarginFix = () => {
+    const styleId = 'rovalra-notification-bell-margin-fix';
+    if (document.getElementById(styleId)) return;
+
+    const style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+        #navbar-stream.navbar-stream.notification-margins {
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+        }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+};
+
+const applyNavbarSearchWidthFix = () => {
+    const setup = () => {
+        const rightNavigationHeader = document.getElementById(
+            'right-navigation-header',
+        );
+        const search = document.querySelector(
+            '[data-testid="navigation-search-input"].navbar-search',
+        );
+        const navbarRight =
+            rightNavigationHeader?.querySelector(
+                '.navbar-right.rbx-navbar-right',
+            ) || document.querySelector('.navbar-right.rbx-navbar-right');
+
+        if (!rightNavigationHeader || !search || !navbarRight) return;
+        if (search.dataset.navbarWidthFixApplied) return;
+        search.dataset.navbarWidthFixApplied = 'true';
+
+        const originalStyles = {
+            width: search.style.width,
+            flexBasis: search.style.flexBasis,
+            maxWidth: search.style.maxWidth,
+        };
+        let applyingStyles = false;
+
+        const restoreOriginalStyles = () => {
+            applyingStyles = true;
+            search.style.width = originalStyles.width;
+            search.style.flexBasis = originalStyles.flexBasis;
+            search.style.maxWidth = originalStyles.maxWidth;
+            applyingStyles = false;
+        };
+
+        const update = () => {
+            if (applyingStyles) return;
+
+            const searchRect = search.getBoundingClientRect();
+            const headerRect = rightNavigationHeader.getBoundingClientRect();
+            const rightRect = navbarRight.getBoundingClientRect();
+            const isRightNavbarWrapped =
+                rightRect.width > 0 && rightRect.top > headerRect.top + 2;
+
+            if (isRightNavbarWrapped && !search.dataset.navbarWidthFixActive) {
+                const nextWidth = Math.max(180, searchRect.width * 0.85);
+
+                applyingStyles = true;
+                search.style.setProperty(
+                    'width',
+                    `${nextWidth}px`,
+                    'important',
+                );
+                search.style.setProperty(
+                    'flex-basis',
+                    `${nextWidth}px`,
+                    'important',
+                );
+                search.style.setProperty(
+                    'max-width',
+                    `${nextWidth}px`,
+                    'important',
+                );
+                applyingStyles = false;
+                search.dataset.navbarWidthFixActive = 'true';
+            } else if (
+                !isRightNavbarWrapped &&
+                search.dataset.navbarWidthFixActive
+            ) {
+                restoreOriginalStyles();
+                delete search.dataset.navbarWidthFixActive;
+            }
+        };
+
+        const updateWhenUnfixed = () => {
+            if (!search.dataset.navbarWidthFixActive) update();
+        };
+
+        observeResize(rightNavigationHeader, updateWhenUnfixed);
+        observeResize(navbarRight, updateWhenUnfixed);
+        window.addEventListener('resize', () => {
+            if (search.dataset.navbarWidthFixActive) {
+                delete search.dataset.navbarWidthFixActive;
+                restoreOriginalStyles();
+            }
+            requestAnimationFrame(update);
+        });
+        update();
+        requestAnimationFrame(update);
+        setTimeout(update, 100);
+    };
+
+    observeElement('#right-navigation-header', setup);
+    observeElement(
+        '[data-testid="navigation-search-input"].navbar-search',
+        setup,
+    );
+};
+
+export function init() {
+    chrome.storage.local.get(
+        [
+            'cssfixesEnabled',
+            'giantInvisibleLink',
+            'profileUsernameSpacingFixEnabled',
+        ],
+        function (data) {
+            if (data.cssfixesEnabled === true) {
+                observeElement(
+                    '#profile-header-container',
+                    applyImpersonateAttribute,
+                );
+                observeElement('.profile-header', applyHeaderFix);
+                applyHomeHeaderLinkFix();
+                applyProfileUsernameSpacingFix(
+                    data.profileUsernameSpacingFixEnabled,
+                );
+                applyGameTitleFix();
+                applyCartRemoveButtonFix();
+                applyProfileGameCardFix();
+                applyFriendsCarouselPaddingFix();
+                applyNavbarSearchWidthFix();
+                applyNotificationBellMarginFix();
+            }
+        },
+    );
+}

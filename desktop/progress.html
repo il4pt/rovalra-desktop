@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src file: data:">
+<title>Roblox hazırlanıyor</title>
+<style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; margin: 0; }
+    html, body { height: 100%; }
+    body {
+        background: #111216;
+        color: #e8e9ec;
+        font: 14px/1.4 system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 14px;
+        padding: 28px 32px;
+        -webkit-app-region: drag;
+        user-select: none;
+    }
+    h1 { font-size: 17px; font-weight: 600; }
+    #text { color: #a3a6ad; min-height: 1.4em; }
+    .bar { height: 6px; border-radius: 3px; background: #26282e; overflow: hidden; }
+    .fill { height: 100%; width: 0; background: #335fff; border-radius: 3px; transition: width .3s; }
+    .indeterminate .fill { width: 30%; animation: slide 1.2s ease-in-out infinite; }
+    @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+    #pct { font-variant-numeric: tabular-nums; color: #a3a6ad; font-size: 12px; text-align: right; }
+</style>
+</head>
+<body>
+    <h1>Roblox hazırlanıyor</h1>
+    <div id="text">Başlatılıyor…</div>
+    <div class="bar indeterminate" id="bar"><div class="fill" id="fill"></div></div>
+    <div id="pct"></div>
+</body>
+</html>

@@ -1,0 +1,149 @@
+import { observeElement } from '../../core/observer.js';
+import { getPlaceIdFromUrl } from '../../core/idExtractor.js';
+import { callRobloxApiJson } from '../../core/api.js';
+import { getAssets } from '../../core/assets.js';
+import { addTooltip } from '../../core/ui/tooltip.js';
+import { ts } from '../../core/locale/i18n.js';
+
+export function init() {
+    chrome.storage.local.get('priceFloorEnabled', (data) => {
+        if (data.priceFloorEnabled === false) return;
+
+        observeElement(
+            '.item-price-value.icon-text-wrapper.clearfix.icon-robux-price-container',
+            async (element) => {
+                if (element.dataset.rovalraPriceFloor) return;
+                element.dataset.rovalraPriceFloor = 'true';
+                element.classList.add('rovalra-price-floor-container');
+
+                const assetId = getPlaceIdFromUrl();
+                if (!assetId) return;
+
+                try {
+                    const isBundlePage =
+                        window.location.pathname.includes('/bundles/');
+                    const itemType = isBundlePage ? 'Bundle' : 'Asset';
+
+                    const details = await callRobloxApiJson({
+                        subdomain: 'catalog',
+                        endpoint: `/v1/catalog/items/${assetId}/details?itemType=${itemType}`,
+                    });
+
+                    if (!details) return;
+
+                    let assetType = isBundlePage
+                        ? details.bundleType
+                        : details.assetType;
+
+                    const isFullMask = details.taxonomy?.some(
+                        (t) => t.taxonomyName === 'Full Masks',
+                    );
+
+                    if (
+                        details.taxonomy?.some(
+                            (t) => t.taxonomyName === 'Heads',
+                        )
+                    ) {
+                        assetType = 2;
+                    }
+
+                    if (!assetType && !isFullMask) return;
+
+                    const isPbr = details.isPBR || false;
+                    const isBodysuit =
+                        details.taxonomy?.some(
+                            (t) => t.taxonomyName === 'Bodysuit',
+                        ) || false;
+
+                    const collectibleItemType =
+                        details.itemRestrictions &&
+                        details.itemRestrictions.includes('Collectible')
+                            ? 1
+                            : 2;
+
+                    const typeParam = isBundlePage ? 'bundleType' : 'assetType';
+
+                    let queryParams = `collectibleItemType=${collectibleItemType}&creationType=1&isPbr=${isPbr}&isBodysuit=${isBodysuit}`;
+
+                    if (isFullMask) {
+                        queryParams += `&categoryId=full_mask%7Cm4.1fullmask_20260224%7C6`;
+                    } else {
+                        queryParams += `&${typeParam}=${assetType}`;
+                    }
+
+                    const priceFloorData = await callRobloxApiJson({
+                        subdomain: 'itemconfiguration',
+                        endpoint: `/v1/items/price-floor?${queryParams}`,
+                    });
+
+                    if (
+                        priceFloorData &&
+                        typeof priceFloorData.priceFloor === 'number'
+                    ) {
+                        const assets = getAssets();
+                        const floor = priceFloorData.priceFloor;
+
+                        const currentPrice = details.lowestPrice;
+                        const hasDiscount =
+                            element.querySelector('.original-price') !== null;
+
+                        const icon = document.createElement('div');
+                        icon.className = 'rovalra-price-floor-icon';
+                        Object.assign(icon.style, {
+                            width: '16px',
+                            height: '16px',
+                            marginLeft: '5px',
+                            cursor: 'help',
+                            display: 'inline-block',
+                            backgroundColor: 'var(--rovalra-main-text-color)',
+                            webkitMask: `url("${assets.priceFloorIcon}") no-repeat center / contain`,
+                            mask: `url("${assets.priceFloorIcon}") no-repeat center / contain`,
+                        });
+
+                        if (!hasDiscount) {
+                            icon.style.verticalAlign = 'text-bottom';
+                        }
+
+                        let tooltipContent = `${ts('priceFloor.label')} <span class="icon-robux-16x16"></span>${floor.toLocaleString()}`;
+
+                        if (
+                            typeof currentPrice === 'number' &&
+                            !isNaN(currentPrice)
+                        ) {
+                            const diff = currentPrice - floor;
+                            const statusKey =
+                                diff > 0 ? 'above' : diff < 0 ? 'below' : 'at';
+                            const status = ts(
+                                `priceFloor.statusTypes.${statusKey}`,
+                            );
+
+                            const diffVal = Math.abs(diff).toLocaleString();
+                            const differenceString =
+                                diff !== 0
+                                    ? ts('priceFloor.difference', {
+                                          diff: `___ICON___${diffVal}`,
+                                      })
+                                    : '';
+
+                            const statusText = ts('priceFloor.status', {
+                                status: status,
+                                difference: differenceString,
+                            });
+                            const finalStatus = statusText.replace(
+                                '___ICON___',
+                                '<span class="icon-robux-16x16"></span>',
+                            );
+
+                            tooltipContent += `<br>${finalStatus}`;
+                        }
+
+                        tooltipContent += `<br><br><span class="text-secondary" style="font-size: 12px;">${ts('priceFloor.description')}</span>`;
+
+                        addTooltip(icon, tooltipContent, { position: 'top' });
+                        element.appendChild(icon);
+                    }
+                } catch (e) {}
+            },
+        );
+    });
+}

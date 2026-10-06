@@ -1,0 +1,181 @@
+// for future features, will be expanded
+export function getPlaceIdFromUrl(url = window.location.href) {
+    try {
+        const urlObj = new URL(url, window.location.origin);
+
+        const queryPlaceId = urlObj.searchParams.get('PlaceId');
+        if (queryPlaceId) {
+            return queryPlaceId;
+        }
+
+        const match = urlObj.pathname.match(
+            /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/(?:games|catalog|bundles|hidden-catalog|looks|library|game-pass|private-games)\/(\d+)/i,
+        );
+        if (match && match[1]) {
+            return match[1];
+        }
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+    }
+
+    const match = url.match(
+        /\/(?:games|catalog|bundles|hidden-catalog|looks|library|game-pass|private-games)\/(\d+)/,
+    );
+    if (match) {
+        return match[1];
+    }
+
+    return null;
+}
+
+export function getBadgeIdFromUrl(url = window.location.href) {
+    try {
+        const urlObj = new URL(url, window.location.origin);
+        const match = urlObj.pathname.match(
+            /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/badges\/(\d+)/i,
+        );
+        return match?.[1] || null;
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+    }
+
+    return url.match(/\/badges\/(\d+)/i)?.[1] || null;
+}
+
+export function getUniverseIdFromUrl(url = window.location.href) {
+    try {
+        const universeId = new URL(
+            url,
+            window.location.origin,
+        ).searchParams.get('universeId');
+
+        return /^\d+$/.test(universeId || '') ? universeId : null;
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+        return null;
+    }
+}
+
+export function getGamePassIdFromUrl(url = window.location.href) {
+    try {
+        const urlObj = new URL(url, window.location.origin);
+        const match = urlObj.pathname.match(
+            /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/game-pass\/(\d+)/i,
+        );
+        if (match && match[1]) {
+            return match[1];
+        }
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+    }
+
+    const match = url.match(/\/game-pass\/(\d+)/i);
+    if (match) {
+        return match[1];
+    }
+
+    return null;
+}
+
+export function getAssetIdFromUrl(url = window.location.href) {
+    try {
+        const urlObj = new URL(url, window.location.origin);
+        const match = urlObj.pathname.match(
+            /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/store\/asset\/(\d+)/i,
+        );
+        if (match && match[1]) {
+            return match[1];
+        }
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+    }
+
+    const match = url.match(/\/store\/asset\/(\d+)/);
+    if (match) {
+        return match[1];
+    }
+
+    return null;
+}
+
+export async function getUserIdFromFriendUrl(url = window.location.href) {
+    try {
+        const urlObj = new URL(url, window.location.origin);
+        const match = urlObj.pathname.match(
+            /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/users\/(\d+)\/friends/i,
+        );
+        if (match && match[1]) {
+            return match[1];
+        }
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+    }
+
+    const match = url.match(/\/(?:users|banned-users)\/(\d+)\/profile/);
+    if (match) {
+        return match[1];
+    }
+
+    return null;
+}
+export function getUserIdFromUrl(url = window.location.href) {
+    try {
+        const urlObj = new URL(url, window.location.origin);
+        const match = urlObj.pathname.match(
+            /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/(?:users|banned-users)\/(\d+)\/profile/i,
+        );
+        if (match && match[1]) {
+            return match[1];
+        }
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+    }
+
+    const match = url.match(/\/(?:users|banned-users)\/(\d+)\/profile/);
+    if (match) {
+        return match[1];
+    }
+
+    return null;
+}
+
+export function getUserIdFromInventoryUrl(url = window.location.href) {
+    try {
+        const urlObj = new URL(url, window.location.origin);
+        const match = urlObj.pathname.match(
+            /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/users\/(\d+\/)?inventory\/?$/i,
+        );
+        if (match && match[1]) {
+            return match[1].replace('/', '');
+        }
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+    }
+
+    return null;
+}
+
+export function getGroupIdFromUrl(url = window.location.href) {
+    try {
+        const urlObj = new URL(url, window.location.origin);
+        const queryGroupId = urlObj.searchParams.get('id');
+        if (queryGroupId && /\/groups\/configure/.test(urlObj.pathname)) {
+            return queryGroupId;
+        }
+        const match = urlObj.pathname.match(
+            /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/(?:groups|communities)\/(\d+)/i,
+        );
+        if (match && match[1]) {
+            return match[1];
+        }
+    } catch (e) {
+        console.warn('RoValra: URL parsing failed', e);
+    }
+
+    const match = url.match(/(?:groups|communities)\/(\d+)/);
+    if (match) {
+        return match[1];
+    }
+
+    return null;
+}

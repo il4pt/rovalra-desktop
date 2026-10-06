@@ -1,0 +1,312 @@
+.left-nav .rovalra-sidebar-layout-button {
+    position: absolute;
+    right: 12px;
+    z-index: 2;
+    flex: 0 0 40px !important;
+    width: 40px !important;
+    max-width: 40px !important;
+    min-width: 40px;
+    padding-right: 0 !important;
+    padding-left: 0 !important;
+    opacity: 1;
+    visibility: visible;
+    transition: opacity 0.12s ease;
+}
+
+.left-nav .rovalra-sidebar-layout-button {
+    bottom: 12px;
+}
+
+.left-nav .rovalra-sidebar-layout-button
+    :is(.rovalra-sidebar-layout-icon, svg) {
+    width: 22px;
+    height: 22px;
+}
+
+.left-nav[data-rovalra-sidebar-collapsed='true'][data-rovalra-sidebar-layout-active='true']
+    .rovalra-sidebar-layout-button {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+#right-navigation-header .rovalra-topbar-layout-button-item {
+    position: relative;
+    float: left;
+    z-index: 2;
+    flex: 0 0 32px !important;
+    width: 32px !important;
+    max-width: 32px !important;
+    min-width: 32px;
+    height: 40px !important;
+    min-height: 40px;
+    margin-left: 8px;
+    padding: 0 !important;
+    list-style: none;
+    opacity: 1;
+    visibility: visible;
+}
+
+#right-navigation-header .rovalra-topbar-layout-button {
+    width: 32px !important;
+    max-width: 32px !important;
+    min-width: 32px;
+    height: 28px !important;
+    min-height: 28px;
+    margin-top: 6px;
+    padding-right: 0 !important;
+    padding-left: 0 !important;
+    opacity: 1;
+    visibility: visible;
+}
+
+#right-navigation-header
+    .rovalra-topbar-layout-button
+    :is(.rovalra-topbar-layout-icon, svg) {
+    width: 18px;
+    height: 18px;
+}
+
+.rovalra-sidebar-layout-hidden,
+.rovalra-topbar-layout-hidden {
+    display: none !important;
+}
+
+#right-navigation-header.rovalra-topbar-layout-search-moved > .search-overlay {
+    background: transparent !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+
+#right-navigation-header.rovalra-topbar-layout-search-moved
+    > .search-overlay
+    :is(ul.new-dropdown-menu, .new-dropdown-menu) {
+    box-sizing: border-box;
+    pointer-events: auto;
+}
+
+#right-navigation-header.rovalra-topbar-layout-search-moved[data-rovalra-topbar-layout-search-edge='left']
+    > .search-overlay
+    :is(ul.new-dropdown-menu, .new-dropdown-menu) {
+    right: auto !important;
+    left: var(--rovalra-topbar-layout-search-left, 12px) !important;
+    max-width: calc(
+        100vw - var(--rovalra-topbar-layout-search-left, 12px) - 12px
+    ) !important;
+    transform: none !important;
+}
+
+#right-navigation-header.rovalra-topbar-layout-search-moved[data-rovalra-topbar-layout-search-edge='right']
+    > .search-overlay
+    :is(ul.new-dropdown-menu, .new-dropdown-menu) {
+    right: var(--rovalra-topbar-layout-search-right, 12px) !important;
+    left: auto !important;
+    max-width: calc(
+        100vw - var(--rovalra-topbar-layout-search-right, 12px) - 12px
+    ) !important;
+    transform: none !important;
+}
+
+#right-navigation-header.rovalra-topbar-layout-search-moved
+    [data-rovalra-topbar-layout-key='search']
+    :is(.search-landing-container, section[data-testid='SearchLandingPageOmniFeedTestId']) {
+    box-sizing: border-box !important;
+}
+
+#right-navigation-header.rovalra-topbar-layout-search-moved[data-rovalra-topbar-layout-search-edge='left']
+    [data-rovalra-topbar-layout-key='search']
+    :is(.search-landing-container, section[data-testid='SearchLandingPageOmniFeedTestId']) {
+    right: auto !important;
+    left: var(--rovalra-topbar-layout-search-left, 12px) !important;
+    width: 800px !important;
+    max-width: calc(
+        100vw - var(--rovalra-topbar-layout-search-left, 12px) - 12px
+    ) !important;
+    transform: none !important;
+}
+
+#right-navigation-header.rovalra-topbar-layout-search-moved[data-rovalra-topbar-layout-search-edge='right']
+    [data-rovalra-topbar-layout-key='search']
+    :is(.search-landing-container, section[data-testid='SearchLandingPageOmniFeedTestId']) {
+    right: var(--rovalra-topbar-layout-search-right, 12px) !important;
+    left: auto !important;
+    width: 800px !important;
+    max-width: calc(
+        100vw - var(--rovalra-topbar-layout-search-right, 12px) - 12px
+    ) !important;
+    transform: none !important;
+}
+
+[data-rovalra-topbar-layout-key][data-rovalra-topbar-layout-edge='left']
+    .popover-content {
+    box-sizing: border-box !important;
+    right: auto !important;
+    left: 12px !important;
+    max-width: calc(100vw - 24px) !important;
+}
+
+[data-rovalra-topbar-layout-key][data-rovalra-topbar-layout-edge='right']
+    .popover-content {
+    box-sizing: border-box !important;
+    right: 12px !important;
+    left: auto !important;
+    max-width: calc(100vw - 24px) !important;
+}
+
+[data-rovalra-topbar-layout-key][data-rovalra-topbar-layout-edge='left']
+    :is(.dropdown-menu, .rbx-dropdown-menu, .popover, [role='menu']) {
+    box-sizing: border-box;
+    right: auto !important;
+    left: 0 !important;
+    max-width: calc(100vw - 24px) !important;
+    transform: none !important;
+}
+
+[data-rovalra-topbar-layout-key][data-rovalra-topbar-layout-edge='right']
+    :is(.dropdown-menu, .rbx-dropdown-menu, .popover, [role='menu']) {
+    box-sizing: border-box;
+    right: 0 !important;
+    left: auto !important;
+    max-width: calc(100vw - 24px) !important;
+    transform: none !important;
+}
+
+@mixin rovalra-layout-editor($prefix) {
+    .#{$prefix}-editor {
+        padding-bottom: 4px;
+    }
+
+    .#{$prefix}-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+    }
+
+    .#{$prefix}-item {
+        display: flex;
+        min-height: 52px;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background-color: var(--rovalra-container-background-color);
+        cursor: grab;
+        transition:
+            transform 0.15s ease,
+            opacity 0.15s ease,
+            background-color 0.15s ease;
+        user-select: none;
+    }
+
+    .#{$prefix}-item:hover {
+        background-color: var(--rovalra-button-background-color);
+    }
+
+    .#{$prefix}-item-hidden {
+        opacity: 0.65;
+    }
+
+    .#{$prefix}-item-disabled {
+        opacity: 0.65;
+    }
+
+    .#{$prefix}-item-hidden .#{$prefix}-label {
+        color: var(--rovalra-secondary-text-color, #606162);
+    }
+
+    .#{$prefix}-drag-source {
+        opacity: 0.3;
+        transform: scale(0.95);
+    }
+
+    .#{$prefix}-drag-clone {
+        z-index: 99999;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+        opacity: 0.8;
+        pointer-events: none;
+        transition: none;
+    }
+
+    .#{$prefix}-drag-handle {
+        display: inline-flex;
+        flex: 0 0 24px;
+        align-items: center;
+        justify-content: center;
+        color: var(--text-secondary, #606162);
+        cursor: inherit;
+    }
+
+    .#{$prefix}-drag-handle :is(.#{$prefix}-icon, svg) {
+        width: 22px;
+        height: 22px;
+    }
+
+    .#{$prefix}-drop-indicator {
+        position: fixed;
+        z-index: 99998;
+        display: none;
+        height: 2px;
+        border-radius: 1px;
+        background-color: var(--rovalra-playbutton-color, #335fff);
+        pointer-events: none;
+        transition: all 0.15s ease;
+    }
+
+    .#{$prefix}-label {
+        overflow: hidden;
+        flex: 1 1 auto;
+        min-width: 0;
+        color: var(--rovalra-main-text-color);
+        font-weight: 700;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .#{$prefix}-visibility-button {
+        display: inline-flex;
+        flex: 0 0 32px;
+        width: 32px;
+        height: 32px;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--rovalra-main-text-color);
+        cursor: pointer;
+    }
+
+    .#{$prefix}-visibility-button:hover {
+        background-color: var(--rovalra-button-background-color);
+    }
+
+    .#{$prefix}-disabled-status {
+        flex: 0 0 auto;
+        color: var(--rovalra-secondary-text-color, #606162);
+        font-size: 12px;
+        font-weight: 600;
+    }
+
+    .#{$prefix}-icon,
+    .#{$prefix}-icon svg {
+        display: block;
+        width: 20px;
+        height: 20px;
+    }
+
+    .#{$prefix}-icon svg {
+        fill: currentColor;
+    }
+
+    .#{$prefix}-empty {
+        margin: 0;
+        color: var(--text-secondary, #606162);
+    }
+}
+
+@include rovalra-layout-editor('rovalra-sidebar-layout');
+@include rovalra-layout-editor('rovalra-topbar-layout');

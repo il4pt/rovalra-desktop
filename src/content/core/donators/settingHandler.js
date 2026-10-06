@@ -1,0 +1,610 @@
+import { callRobloxApiJson } from '../api.js';
+import { getValidAccessToken } from '../oauth/oauth.js';
+import { getAuthenticatedUserId } from '../user.js';
+import {
+    getTemporaryLimitedUserMessage,
+    isTemporaryLimitedError,
+    refreshModerationStatusAfterLimitedError,
+} from '../moderationStatus.js';
+import {
+    TRUSTED_USER_IDS,
+    ARTIST_USER_IDS,
+    RAT_BADGE_USER_ID,
+    BLAHAJ_BADGE_USER_ID,
+    CAM_BADGE_USER_ID,
+    alice_badge_user_id,
+    GILBERT_USER_ID,
+} from '../configs/userIds.js';
+import * as cache from '../storage/cacheHandler.js';
+import { normalizeProfilePronouns } from '../profile/pronouns.js';
+import { findFrameByLink, getFrames } from '../configs/frames.js';
+
+const GRADIENT_NAME_API_KEY = 'GradientName';
+
+function extractBadgeLinks(apiSettings) {
+    const badges = apiSettings?.badges;
+    if (!badges || typeof badges !== 'object') return {};
+
+    return Object.fromEntries(
+        Object.entries(badges).flatMap(([key, value]) => {
+            return typeof value === 'string' && value.trim()
+                ? [[key, value.trim()]]
+                : [];
+        }),
+    );
+}
+
+function extractProfilePronouns(apiSettings) {
+    const value =
+        apiSettings?.pronouns ??
+        apiSettings?.Pronouns ??
+        apiSettings?.user_tag ??
+        apiSettings?.userTag;
+    return normalizeProfilePronouns(value);
+}
+
+async function normalizeBertLink(value) {
+    const candidate =
+        value && typeof value === 'object'
+            ? (value.link ?? value.value)
+            : value;
+    if (!candidate || candidate === 'none') return null;
+
+    const frames = await getFrames().catch(() => []);
+    return findFrameByLink(frames, candidate)?.link || String(candidate);
+}
+
+const BATCH_MAX_SIZE = 50;
+const BATCH_DELAY_MS = 10;
+let batchQueue = [];
+let batchTimeout = null;
+let batchInProgress = false;
+const memoryCache = new Map();
+const pendingResolvers = new Map();
+
+function assertValidUserId(userId) {
+    if (
+        userId === null ||
+        userId === undefined ||
+        String(userId).trim() === '' ||
+        String(userId).toLowerCase() === 'null'
+    ) {
+        throw new Error(
+            'RoValra: Cannot fetch user settings without a valid user ID.',
+        );
+    }
+}
+
+const OWN_SETTINGS_STALE_MS = 300000;
+const OTHER_SETTINGS_STALE_MS = 300000;
+
+async function saveToCache(cacheKey, settings) {
+    const cacheData = {
+        data: settings,
+        timestamp: Date.now(),
+    };
+    memoryCache.set(cacheKey, cacheData);
+    await cache.set('user_settings', cacheKey, cacheData, 'local');
+}
+
+export async function invalidateAuthenticatedUserSettingsCache() {
+    const authenticatedUserId = await getAuthenticatedUserId();
+    if (!authenticatedUserId) return;
+
+    const cacheKey = String(authenticatedUserId);
+    memoryCache.delete(cacheKey);
+    await cache.remove('user_settings', cacheKey, 'local');
+}
+
+async function fetchAndProcessSettings(userId, options = {}) {
+    assertValidUserId(userId);
+
+    const authenticatedUserId = await getAuthenticatedUserId();
+    const isOwnProfile =
+        authenticatedUserId && String(authenticatedUserId) === String(userId);
+
+    let apiSettings = {};
+    let apiProvidedMeaningfulSettings = false;
+    try {
+        let data;
+        if (isOwnProfile && !options.forcePublicEndpoint) {
+            const token = await getValidAccessToken(false, false);
+            if (token) {
+                data = await callRobloxApiJson({
+                    isRovalraApi: true,
+                    subdomain: 'apis',
+                    endpoint: '/v1/auth/settings',
+                    method: 'GET',
+                    retryOnTransientStatus: false,
+                });
+
+                if (data.status === 'success' && data.setting) {
+                    data.settings = {
+                        [data.setting.key]: data.setting.value,
+                    };
+                }
+            }
+        }
+
+        if (!data) {
+            data = await callRobloxApiJson({
+                isRovalraApi: true,
+                subdomain: 'apis',
+                endpoint: `/v1/users/${userId}/settings`,
+                method: 'GET',
+                noCache: options.noCache || isOwnProfile,
+                retryOnTransientStatus: false,
+            });
+        }
+
+        if (data.status === 'success' && data.settings) {
+            apiSettings = data.settings;
+
+            if (
+                (apiSettings.environment === 0 ||
+                    apiSettings.environment === 1) &&
+                !apiSettings.status &&
+                !apiSettings.border &&
+                !apiSettings.berts &&
+                !apiSettings.gradient &&
+                !apiSettings[GRADIENT_NAME_API_KEY] &&
+                !apiSettings.GradientName &&
+                !apiSettings.gradientName &&
+                !extractProfilePronouns(apiSettings) &&
+                !Number(apiSettings.fav_game) &&
+                !Number(apiSettings.fav_group) &&
+                !Number(apiSettings.fav_decal) &&
+                !Object.keys(extractBadgeLinks(apiSettings)).length &&
+                Object.keys(apiSettings).length <= 4 &&
+                !apiSettings.theme
+            ) {
+                apiProvidedMeaningfulSettings = false;
+            } else {
+                apiProvidedMeaningfulSettings = true;
+            }
+        }
+    } catch (error) {
+        console.warn('RoValra: Failed to fetch settings from API.', error);
+        apiProvidedMeaningfulSettings = false;
+    }
+
+    let finalStatus = null;
+    let finalEnvironment = 1;
+    let finalGradient = null;
+    let finalBorder = null;
+    let finalFrame = null;
+    let finalGradientName = null;
+
+    if (apiProvidedMeaningfulSettings) {
+        finalStatus = apiSettings.status;
+        finalEnvironment = apiSettings.environment;
+        finalGradient = apiSettings.gradient;
+        finalBorder = apiSettings.border ?? null;
+        finalFrame = await normalizeBertLink(apiSettings.berts);
+        finalGradientName =
+            apiSettings[GRADIENT_NAME_API_KEY] ??
+            apiSettings.GradientName ??
+            apiSettings.gradientName ??
+            null;
+    }
+
+    if (
+        isOwnProfile &&
+        apiSettings &&
+        apiSettings.border &&
+        apiProvidedMeaningfulSettings
+    ) {
+        document.dispatchEvent(
+            new CustomEvent('rovalra:syncAvatarBorder', {
+                detail: { borderUrl: apiSettings.border },
+            }),
+        );
+    }
+
+    if (
+        isOwnProfile &&
+        apiSettings &&
+        apiSettings.berts &&
+        apiProvidedMeaningfulSettings
+    ) {
+        document.dispatchEvent(
+            new CustomEvent('rovalra:syncProfileFrame', {
+                detail: { frameUrl: finalFrame },
+            }),
+        );
+    }
+
+    return {
+        status: finalStatus,
+        environment: finalEnvironment || 1,
+        gradient: finalGradient,
+        GradientName: finalGradientName,
+        border: finalBorder,
+        berts: finalFrame,
+        pronouns: extractProfilePronouns(apiSettings),
+        Views: Number(apiSettings.Views) || 0,
+        hide_views:
+            apiSettings.hide_views === 'true' ||
+            apiSettings.hide_views === true,
+        canUseApi: apiProvidedMeaningfulSettings,
+        anonymous_leaderboard:
+            apiSettings.anonymous_leaderboard === 'true' ||
+            apiSettings.anonymous_leaderboard === true,
+        fav_game: Number(apiSettings.fav_game) || 0,
+        fav_group: Number(apiSettings.fav_group) || 0,
+        fav_decal: Number(apiSettings.fav_decal) || 0,
+        badges: extractBadgeLinks(apiSettings),
+        theme: apiSettings.theme || '',
+    };
+}
+
+async function processBatchQueue() {
+    if (batchInProgress || batchQueue.length === 0) return;
+
+    batchInProgress = true;
+    // Only remove the portion that is sent in this request. The remaining
+    // entries stay queued for the next batch instead of falling back to one
+    // request per user.
+    const currentBatch = batchQueue.splice(0, BATCH_MAX_SIZE);
+    clearTimeout(batchTimeout);
+    batchTimeout = null;
+
+    const processedKeys = new Set();
+
+    try {
+        const authedId = await getAuthenticatedUserId();
+        const authenticatedUserId = authedId ? String(authedId) : null;
+
+        const userIdsToFetch = currentBatch
+            .map((item) => item.userId)
+            .filter(
+                (id, index, self) =>
+                    String(id) !== authenticatedUserId &&
+                    self.indexOf(id) === index,
+            );
+        const userIdsToFetchStrings = userIdsToFetch.map((id) => String(id));
+
+        if (userIdsToFetch.length > 0) {
+            // VALRA EDIT HERE: /v1/users/settings?user_ids=... GET should return
+            // `border` in each user's settings object alongside status, environment
+            // and gradient, so other users' borders can be displayed.
+            const data = await callRobloxApiJson({
+                isRovalraApi: true,
+                subdomain: 'apis',
+                endpoint: `/v1/users/settings?user_ids=${userIdsToFetchStrings.join(',')}`,
+                method: 'GET',
+                retryOnTransientStatus: false,
+            });
+
+            if (data.status === 'success' && data.settings) {
+                for (const [userId, apiSettings] of Object.entries(
+                    data.settings,
+                )) {
+                    const batchItems = currentBatch.filter(
+                        (item) => String(item.userId) === String(userId),
+                    );
+
+                    for (const item of batchItems) {
+                        const cacheKey = String(userId);
+                        if (processedKeys.has(cacheKey)) continue;
+
+                        const settings = await processApiSettings(
+                            userId,
+                            apiSettings,
+                            item.options,
+                        );
+
+                        await saveToCache(cacheKey, settings);
+                        processedKeys.add(cacheKey);
+
+                        const resolvers = pendingResolvers.get(cacheKey);
+                        if (resolvers) {
+                            resolvers.forEach((r) => r.resolve(settings));
+                            pendingResolvers.delete(cacheKey);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (const batchItem of currentBatch) {
+            const cacheKey = String(batchItem.userId);
+            if (!processedKeys.has(cacheKey)) {
+                const settings = await fetchAndProcessSettings(
+                    batchItem.userId,
+                    batchItem.options,
+                );
+
+                await saveToCache(cacheKey, settings);
+                processedKeys.add(cacheKey);
+
+                const resolvers = pendingResolvers.get(cacheKey);
+                if (resolvers) {
+                    resolvers.forEach((r) => r.resolve(settings));
+                    pendingResolvers.delete(cacheKey);
+                }
+            }
+        }
+    } catch (error) {
+        console.warn(
+            'RoValra: Batch settings fetch failed without retrying.',
+            error,
+        );
+
+        for (const batchItem of currentBatch) {
+            const cacheKey = String(batchItem.userId);
+            const resolvers = pendingResolvers.get(cacheKey);
+            if (resolvers) {
+                resolvers.forEach((r) => r.reject(error));
+                pendingResolvers.delete(cacheKey);
+            }
+        }
+    } finally {
+        batchInProgress = false;
+        if (batchQueue.length > 0) {
+            batchTimeout = setTimeout(processBatchQueue, BATCH_DELAY_MS);
+        }
+    }
+}
+
+async function processApiSettings(userId, apiSettings, options) {
+    assertValidUserId(userId);
+
+    const authenticatedUserId = await getAuthenticatedUserId();
+    const isOwnProfile =
+        authenticatedUserId && String(authenticatedUserId) === String(userId);
+
+    let apiProvidedMeaningfulSettings = false;
+
+    if (apiSettings && typeof apiSettings === 'object') {
+        if (
+            (apiSettings.environment === 0 || apiSettings.environment === 1) &&
+            !apiSettings.status &&
+            !apiSettings.border &&
+            !apiSettings.berts &&
+            !apiSettings.gradient &&
+            !apiSettings[GRADIENT_NAME_API_KEY] &&
+            !apiSettings.GradientName &&
+            !apiSettings.gradientName &&
+            !extractProfilePronouns(apiSettings) &&
+            !Number(apiSettings.fav_game) &&
+            !Number(apiSettings.fav_group) &&
+            !Number(apiSettings.fav_decal) &&
+            !Object.keys(extractBadgeLinks(apiSettings)).length &&
+            Object.keys(apiSettings).length <= 4 &&
+            !apiSettings.theme
+        ) {
+            apiProvidedMeaningfulSettings = false;
+        } else {
+            apiProvidedMeaningfulSettings = true;
+        }
+    }
+
+    let finalStatus = null;
+    let finalEnvironment = 1;
+    let finalGradient = null;
+    let finalBorder = null;
+    let finalFrame = null;
+    let finalGradientName = null;
+
+    if (apiProvidedMeaningfulSettings) {
+        finalStatus = apiSettings.status;
+        finalEnvironment = apiSettings.environment;
+        finalGradient = apiSettings.gradient;
+        finalBorder = apiSettings.border ?? null;
+
+        finalFrame = await normalizeBertLink(apiSettings.berts);
+        finalGradientName =
+            apiSettings[GRADIENT_NAME_API_KEY] ??
+            apiSettings.GradientName ??
+            apiSettings.gradientName ??
+            null;
+    }
+
+    if (
+        isOwnProfile &&
+        apiSettings &&
+        apiSettings.border &&
+        apiProvidedMeaningfulSettings
+    ) {
+        document.dispatchEvent(
+            new CustomEvent('rovalra:syncAvatarBorder', {
+                detail: { borderUrl: apiSettings.border },
+            }),
+        );
+    }
+
+    if (
+        isOwnProfile &&
+        apiSettings &&
+        apiSettings.berts &&
+        apiProvidedMeaningfulSettings
+    ) {
+        document.dispatchEvent(
+            new CustomEvent('rovalra:syncProfileFrame', {
+                detail: { frameUrl: finalFrame },
+            }),
+        );
+    }
+
+    return {
+        status: finalStatus,
+        environment: finalEnvironment || 1,
+        gradient: finalGradient,
+        GradientName: finalGradientName,
+        border: finalBorder,
+        berts: finalFrame,
+        pronouns: extractProfilePronouns(apiSettings),
+        Views: Number(apiSettings.Views) || 0,
+        hide_views:
+            apiSettings.hide_views === 'true' ||
+            apiSettings.hide_views === true,
+        canUseApi: apiProvidedMeaningfulSettings,
+        anonymous_leaderboard:
+            apiSettings.anonymous_leaderboard === 'true' ||
+            apiSettings.anonymous_leaderboard === true,
+        fav_game: Number(apiSettings.fav_game) || 0,
+        fav_group: Number(apiSettings.fav_group) || 0,
+        fav_decal: Number(apiSettings.fav_decal) || 0,
+        badges: extractBadgeLinks(apiSettings),
+        theme: apiSettings.theme || '',
+    };
+}
+
+export async function getUserSettings(userId, options = {}) {
+    assertValidUserId(userId);
+
+    const authedId = await getAuthenticatedUserId();
+    const authenticatedUserId = authedId ? String(authedId) : null;
+    const strUserId = String(userId);
+    const isOwnProfile =
+        authenticatedUserId && strUserId === authenticatedUserId;
+
+    const cacheKey = strUserId;
+
+    if (!options.noCache) {
+        const memCached = memoryCache.get(cacheKey);
+        if (memCached) {
+            const staleThreshold = isOwnProfile
+                ? OWN_SETTINGS_STALE_MS
+                : OTHER_SETTINGS_STALE_MS;
+            const isStale =
+                Date.now() - (memCached.timestamp || 0) > staleThreshold;
+            if (isStale && !pendingResolvers.has(cacheKey)) {
+                if (options.disableBatch) {
+                    fetchAndProcessSettings(userId, options).then((settings) =>
+                        saveToCache(cacheKey, settings),
+                    );
+                } else {
+                    batchQueue.push({ userId, options });
+                    pendingResolvers.set(cacheKey, [
+                        {
+                            resolve: () => {},
+                            reject: () => {},
+                        },
+                    ]);
+                    if (!batchTimeout) {
+                        batchTimeout = setTimeout(
+                            processBatchQueue,
+                            BATCH_DELAY_MS,
+                        );
+                    }
+                }
+            }
+            return memCached.data;
+        }
+
+        const cached = await cache.get('user_settings', cacheKey, 'local');
+        if (cached) {
+            memoryCache.set(cacheKey, cached);
+            const staleThreshold = isOwnProfile
+                ? OWN_SETTINGS_STALE_MS
+                : OTHER_SETTINGS_STALE_MS;
+            const isStale =
+                Date.now() - (cached.timestamp || 0) > staleThreshold;
+            if (isStale && !pendingResolvers.has(cacheKey)) {
+                if (options.disableBatch) {
+                    fetchAndProcessSettings(userId, options).then((settings) =>
+                        saveToCache(cacheKey, settings),
+                    );
+                } else {
+                    batchQueue.push({ userId, options });
+                    pendingResolvers.set(cacheKey, [
+                        {
+                            resolve: () => {},
+                            reject: () => {},
+                        },
+                    ]);
+                    if (!batchTimeout) {
+                        batchTimeout = setTimeout(
+                            processBatchQueue,
+                            BATCH_DELAY_MS,
+                        );
+                    }
+                }
+            }
+            return cached.data;
+        }
+    }
+
+    if (pendingResolvers.has(cacheKey)) {
+        return new Promise((resolve, reject) => {
+            pendingResolvers.get(cacheKey).push({ resolve, reject });
+        });
+    }
+
+    if (options.disableBatch) {
+        const settings = await fetchAndProcessSettings(userId, options);
+        await saveToCache(cacheKey, settings);
+
+        return settings;
+    }
+
+    return new Promise((resolve, reject) => {
+        batchQueue.push({ userId, options });
+        pendingResolvers.set(cacheKey, [{ resolve, reject }]);
+
+        if (!batchTimeout) {
+            batchTimeout = setTimeout(processBatchQueue, BATCH_DELAY_MS);
+        }
+    });
+}
+
+/**
+ * Updates a user setting via the RoValra API.
+ * @param {string} key The setting key to update (e.g., 'environment', 'status').
+ * @param {any} value The new value for the setting.
+ * @returns {Promise<boolean>} True if the update was successful, false otherwise.
+ */
+export async function updateUserSettingViaApi(key, value, options = {}) {
+    try {
+        const token = await getValidAccessToken(false, false);
+        if (!token) return false;
+
+        const apiValue = key === 'hide_views' ? Boolean(value) : String(value);
+
+        const response = await callRobloxApiJson({
+            isRovalraApi: true,
+            subdomain: 'apis',
+            endpoint: '/v1/auth/settings',
+            method: 'POST',
+            body: JSON.stringify({ key, value: apiValue }),
+            retryOnTransientStatus: false,
+        });
+        if (
+            response &&
+            response.status === 'success' &&
+            response.setting &&
+            response.setting.key === key
+        ) {
+            await invalidateAuthenticatedUserSettingsCache();
+            return response.setting.value;
+        }
+
+        if (
+            response?.status === 'success' &&
+            response.settings &&
+            Object.prototype.hasOwnProperty.call(response.settings, key)
+        ) {
+            await invalidateAuthenticatedUserSettingsCache();
+            return response.settings[key];
+        }
+        return false;
+    } catch (error) {
+        if (isTemporaryLimitedError(error)) {
+            const moderationStatus =
+                await refreshModerationStatusAfterLimitedError(error);
+            error.userMessage =
+                getTemporaryLimitedUserMessage(moderationStatus);
+        }
+
+        if (!options.suppressErrorLog) {
+            console.error(
+                `RoValra: Failed to update setting '${key}' via API.`,
+                error,
+            );
+        }
+        if (options.throwOnError) throw error;
+        return false;
+    }
+}

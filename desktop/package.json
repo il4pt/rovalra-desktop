@@ -1,0 +1,79 @@
+{
+  "name": "rovalra-desktop",
+  "productName": "RoValra Desktop",
+  "version": "1.0.0",
+  "description": "Unofficial desktop client (Linux/Windows) that runs the Roblox website with the RoValra extension built in",
+  "main": "main.js",
+  "license": "GPL-3.0",
+  "author": {
+    "name": "RoValra Desktop contributors"
+  },
+  "private": true,
+  "scripts": {
+    "build:ext": "cd .. && npm run build && cd desktop && node prepare-extension.js",
+    "start": "node prepare-extension.js && electron .",
+    "dev": "npm run build:ext && electron .",
+    "dist:linux": "npm run build:ext && node pack.js --linux",
+    "dist:win": "npm run build:ext && node pack.js --win",
+    "dist": "npm run build:ext && node pack.js --linux --win portable"
+  },
+  "build": {
+    "appId": "io.github.rovalra-desktop",
+    "productName": "RoValra Desktop",
+    "files": [
+      "main.js",
+      "preload.js",
+      "launcher.js",
+      "sober.js",
+      "bridge.js",
+      "gamemode.js",
+      "sw-preload.js",
+      "progress.html",
+      "overlay.html",
+      "overlay.js",
+      "overlay-preload.js",
+      "icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "extension",
+        "to": "extension"
+      }
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "category": "Game",
+      "icon": "icon.png",
+      "syncDesktopName": true,
+      "maintainer": "RoValra Desktop contributors"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "RoValra-Desktop-${version}-win-${arch}-setup.${ext}"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "artifactName": "RoValra-Desktop-${version}-${os}-${arch}.${ext}",
+    "portable": {
+      "artifactName": "RoValra-Desktop-${version}-win-${arch}-portable.${ext}"
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3"
+  },
+  "desktopName": "rovalra-desktop.desktop",
+  "homepage": "https://github.com/NotValra/RoValra"
+}

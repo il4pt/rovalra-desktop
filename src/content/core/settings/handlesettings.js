@@ -1,0 +1,2402 @@
+import { SETTINGS_CONFIG } from './settingConfig.js';
+import { getBorders } from '../configs/borders.js';
+import { findSettingConfig } from './generateSettings.js';
+import { getFullRegionName, REGIONS } from '../regions.js';
+import { sanitizeString } from '../utils/sanitize.js';
+import { callRobloxApiJson } from '../api.js';
+import { getAuthenticatedUserId } from '../user.js';
+import { updateUserSettingViaApi } from '../donators/settingHandler.js';
+import { serializeGradientNameSetting } from '../donators/gradientName.js';
+import { createAndShowPopup } from '../../features/catalog/40method.js';
+import * as CacheHandler from '../storage/cacheHandler.js';
+import { hasOwn } from '../utils.js';
+import { showConfirmationPrompt } from '../ui/confirmationPrompt.js';
+import { showSystemAlert } from '../ui/roblox/alert.js';
+import { ts } from '../locale/i18n.js';
+import { requestTouAgreement } from '../ui/tou/touAgreement.js';
+import {
+    normalizeProfilePronouns,
+    replacePronounSpecialCharacters,
+    getProfilePronounsForUser,
+    setProfilePronounsForUser,
+    truncateProfilePronouns,
+} from '../profile/pronouns.js';
+import {
+    REMOTE_SETTING_LOCKS_KEY,
+    REMOTE_SETTING_LOCK_REASON,
+    REMOTE_SETTING_OVERRIDE_KEY,
+    getRemoteSettingLocks,
+    refreshRemoteSettingLocks,
+} from './remoteSettingLocks.js';
+import { sanitizeBackgroundImage } from '../backgroundImage.js';
+import './settingsCompat';
+
+let currentUserTierLoaded = false;
+let currentUserTier = 0;
+let gradientSyncTimeout = null;
+let gradientNameSyncTimeout = null;
+let donatorTierPromise = null;
+let inMemoryDonatorResponse = null;
+let inMemoryDonatorUserId = null;
+let settingsKeySyncQueue = Promise.resolve();
+const colorLiveSaveTimeouts = new Map();
+const FEATURE_STATUS_PROMPT_ACK_KEY = 'featureStatusPromptAcknowledged';
+const PROFILE_PRONOUNS_SETTING_NAME = 'profilePronouns';
+const PROFILE_PRONOUNS_API_KEY = 'pronouns';
+const PROFILE_PRONOUNS_AGREEMENT_KEY = 'rovalra_pronouns_guidelines_agreed';
+const INVALID_HTTP_URL = Symbol('invalid-http-url');
+
+function applyCharacterReplacements(value, replacements) {
+    if (typeof value !== 'string' || !replacements) return value;
+
+    return Object.entries(replacements).reduce(
+        (result, [search, replacement]) =>
+            search ? result.split(search).join(String(replacement)) : result,
+        value,
+    );
+}
+
+function restoreProfilePronounsInput(value) {
+    const input = document.getElementById(PROFILE_PRONOUNS_SETTING_NAME);
+    if (!(input instanceof HTMLInputElement)) return;
+
+    input.value = value || '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function consumeProfilePronounsInputAgreement() {
+    const input = document.getElementById(PROFILE_PRONOUNS_SETTING_NAME);
+    if (!(input instanceof HTMLInputElement)) return false;
+    if (input.dataset.rovalraAgreementConfirmedForEdit !== 'true') {
+        return false;
+    }
+
+    delete input.dataset.rovalraAgreementConfirmedForEdit;
+    return true;
+}
+
+async function prepareProfilePronounsUpdate(value) {
+    const normalizedValue = normalizeProfilePronouns(value);
+    const authenticatedUserId = await getAuthenticatedUserId();
+    const previousValue = await getProfilePronounsForUser(authenticatedUserId);
+
+    const changed = normalizedValue !== previousValue;
+
+    if (changed && normalizedValue) {
+        const agreedForCurrentEdit = consumeProfilePronounsInputAgreement();
+        if (!agreedForCurrentEdit) {
+            const agreed = await requestTouAgreement({
+                agreementKey: PROFILE_PRONOUNS_AGREEMENT_KEY,
+            });
+            if (!agreed) {
+                restoreProfilePronounsInput(previousValue);
+                return { shouldSave: false };
+            }
+        }
+
+        try {
+            const validation = await callRobloxApiJson({
+                subdomain: 'contacts',
+                endpoint: `/v1/user/tag/validate?alias=${encodeURIComponent(normalizedValue)}`,
+                method: 'GET',
+                noCache: true,
+            });
+            const validationStatus = String(
+                validation?.status || '',
+            ).toLowerCase();
+            if (validationStatus !== 'success') {
+                restoreProfilePronounsInput(previousValue);
+                showSystemAlert(
+                    validationStatus === 'toolong'
+                        ? ts('settings.ui.pronouns.tooLong')
+                        : ts('settings.ui.pronouns.filterRejected'),
+                    'warning',
+                );
+                return { shouldSave: false };
+            }
+        } catch (error) {
+            restoreProfilePronounsInput(previousValue);
+            let validationErrorMessage =
+                ts('settings.ui.pronouns.checkFailed');
+            if (error?.status === 400) {
+                validationErrorMessage = ts('settings.ui.pronouns.filterRejected');
+            } else if (error?.status === 429) {
+                validationErrorMessage = ts('settings.ui.pronouns.filterBusy');
+            }
+            showSystemAlert(validationErrorMessage, 'warning');
+            return { shouldSave: false };
+        }
+    }
+
+    let apiSynced = false;
+    try {
+        const updatedValue = await updateUserSettingViaApi(
+            PROFILE_PRONOUNS_API_KEY,
+            normalizedValue || '',
+            {
+                throwOnError: true,
+                suppressErrorLog: true,
+            },
+        );
+        if (
+            updatedValue === false ||
+            normalizeProfilePronouns(updatedValue) !== normalizedValue
+        ) {
+            throw new Error('RoValra did not confirm the pronouns update.');
+        }
+        apiSynced = true;
+    } catch (error) {
+        console.warn(
+            'RoValra: Pronouns will remain local because API sync failed.',
+            error,
+        );
+    }
+
+    return {
+        shouldSave: true,
+        value: normalizedValue,
+        changed,
+        syncFailed: !apiSynced,
+        userId: authenticatedUserId,
+    };
+}
+
+const isUnavailableSetting = (config) =>
+    hasOwn(config, 'locked') || hasOwn(config, 'deprecated');
+
+const isStatusLabeledOffByDefaultSetting = (config) =>
+    config?.type === 'checkbox' &&
+    config.default === false &&
+    (hasOwn(config, 'experimental') ||
+        hasOwn(config, 'deprecated') ||
+        hasOwn(config, 'beta'));
+
+const getFeatureStatusPromptPills = () =>
+    [
+        `<span class="rovalra-pill experimental">${ts('settings.ui.controls.experimental')}</span>`,
+        `<span class="rovalra-pill beta">${ts('settings.ui.controls.beta')}</span>`,
+        `<span class="rovalra-pill deprecated">${ts('settings.ui.controls.deprecated')}</span>`,
+    ].join('');
+
+const shouldShowFeatureStatusPrompt = async (config) => {
+    if (!isStatusLabeledOffByDefaultSetting(config)) return false;
+
+    const result = await chrome.storage.local.get([
+        FEATURE_STATUS_PROMPT_ACK_KEY,
+        'forceFeatureStatusPrompt',
+    ]);
+
+    return (
+        result.forceFeatureStatusPrompt === true ||
+        result[FEATURE_STATUS_PROMPT_ACK_KEY] !== true
+    );
+};
+
+const markFeatureStatusPromptAcknowledged = async () => {
+    await chrome.storage.local.set({ [FEATURE_STATUS_PROMPT_ACK_KEY]: true });
+};
+
+function normalizeHttpUrlSetting(value) {
+    if (value === null || value === undefined) return null;
+
+    const trimmedValue = String(value).trim();
+    if (!trimmedValue) return null;
+
+    try {
+        const url = new URL(trimmedValue);
+        return url.protocol === 'http:' || url.protocol === 'https:'
+            ? trimmedValue
+            : INVALID_HTTP_URL;
+    } catch {
+        return INVALID_HTTP_URL;
+    }
+}
+
+async function restoreTextSettingInput(settingName) {
+    const input = document.getElementById(settingName);
+    if (!(input instanceof HTMLInputElement)) return;
+
+    const storedSettings = await chrome.storage.local.get([
+        settingName,
+        'rovalra_settings',
+    ]);
+    const storedValue =
+        storedSettings[settingName] ??
+        storedSettings.rovalra_settings?.[settingName] ??
+        '';
+
+    input.value = typeof storedValue === 'string' ? storedValue : '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+async function restoreTextSettingInputValue(settingName, value) {
+    const input = document.getElementById(settingName);
+    if (!(input instanceof HTMLInputElement)) return;
+
+    input.value = typeof value === 'string' ? value : '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function queueGradientNameSync(settingsOverride = {}) {
+    if (gradientNameSyncTimeout) clearTimeout(gradientNameSyncTimeout);
+
+    gradientNameSyncTimeout = setTimeout(async () => {
+        if (currentUserTier < 3) return;
+
+        const settings = {
+            ...(await loadSettings()),
+            ...settingsOverride,
+        };
+        const gradient =
+            settings.displayNameGradientEnabled === false
+                ? { ...(settings.displayNameGradient || {}), enabled: false }
+                : settings.displayNameGradient;
+        const payload = serializeGradientNameSetting(
+            gradient,
+            settings.displayNameGradientEffect,
+        );
+
+        updateUserSettingViaApi('GradientName', payload).catch((error) =>
+            console.error('RoValra: GradientName sync failed', error),
+        );
+    }, 750);
+}
+/**
+    @description Tier may not be always initalized either use getCurrentUserTier (async func) or call syncDonatorTier first.
+*/
+export const getCurrentUserTierSync = () => currentUserTier;
+
+/**
+ * @description get User Tier but calls syncDonatorTier if not initalized
+ */
+export const getCurrentUserTier = async () => {
+    if (!currentUserTierLoaded) await syncDonatorTier();
+    return currentUserTier;
+};
+
+export const syncDonatorTier = async ({ force = false } = {}) => {
+    if (donatorTierPromise) return donatorTierPromise;
+
+    const now = Date.now();
+    const currentHref = window.location.href;
+    const currentPath = window.location.pathname;
+    const storePageUrl = 'store-section/9452973012';
+    const currentUserId = await getAuthenticatedUserId();
+
+    if (!currentUserId) {
+        return null;
+    }
+
+    if (inMemoryDonatorUserId !== currentUserId) {
+        inMemoryDonatorUserId = currentUserId;
+        inMemoryDonatorResponse = null;
+    }
+
+    const state = (await CacheHandler.get(
+        'donator_info',
+        'sync_state',
+        'local',
+    )) || {
+        lastSync: 0,
+        cachedResponse: null,
+        priorityActive: false,
+        checksLeft: 0,
+        lastPath: '',
+        lastTier: 0,
+        userId: null,
+    };
+
+    if (state.userId !== currentUserId) {
+        state.lastSync = 0;
+        state.cachedResponse = null;
+        state.lastTier = 0;
+        state.userId = currentUserId;
+        currentUserTier = 0;
+
+        await CacheHandler.set('donator_info', 'sync_state', state, 'local');
+    }
+
+    if (state.lastTier !== undefined) currentUserTier = state.lastTier;
+
+    if (currentHref.includes(storePageUrl)) {
+        state.priorityActive = true;
+        state.checksLeft = 10;
+    }
+
+    const isUrlChange = currentPath !== state.lastPath;
+    const isPriorityCheck =
+        state.priorityActive && isUrlChange && state.checksLeft > 0;
+    const isExpired = now - state.lastSync > 5 * 60 * 1000;
+
+    if (!force && !isPriorityCheck && !isExpired) {
+        const cachedResponse =
+            inMemoryDonatorResponse || state.cachedResponse || null;
+        if (cachedResponse) {
+            inMemoryDonatorResponse = cachedResponse;
+            currentUserTierLoaded = true;
+            return cachedResponse;
+        }
+    }
+
+    donatorTierPromise = (async () => {
+        try {
+            const response = await callRobloxApiJson({
+                isRovalraApi: true,
+                subdomain: 'apis',
+                endpoint: '/v1/auth/badges',
+                method: 'GET',
+            });
+
+            if (!response?.badges) {
+                return inMemoryDonatorResponse || null;
+            }
+
+            const badges = response.badges;
+            let tier = 0;
+            if (badges.donator_3 || badges.legacy_donator) {
+                tier = 3;
+            } else if (badges.donator_2) {
+                tier = 2;
+            } else if (badges.donator_1) {
+                tier = 1;
+            }
+
+            if (state.priorityActive && isUrlChange) {
+                if (tier !== state.lastTier) {
+                    state.priorityActive = false;
+                    state.checksLeft = 0;
+                } else {
+                    state.checksLeft--;
+                    if (state.checksLeft <= 0) {
+                        state.priorityActive = false;
+                    }
+                }
+            }
+
+            currentUserTier = tier;
+            state.lastTier = tier;
+            state.lastSync = Date.now();
+            state.lastPath = currentPath;
+            inMemoryDonatorResponse = response;
+            state.userId = currentUserId;
+            state.cachedResponse = response;
+
+            await CacheHandler.set(
+                'donator_info',
+                'sync_state',
+                state,
+                'local',
+            );
+
+            const settingsContent = document.querySelector(
+                '#setting-section-content',
+            );
+            if (settingsContent) {
+                const settings = await loadSettings();
+                await checkSettingLocks(settingsContent, settings);
+            }
+
+            currentUserTierLoaded = true;
+
+            return response;
+        } catch (error) {
+            console.error('RoValra: Failed to sync donator tier.', {
+                userId: currentUserId,
+                endpoint: '/v1/auth/badges',
+                method: 'GET',
+                error: error.message || error,
+                stack: error.stack,
+            });
+            return inMemoryDonatorResponse || null;
+        } finally {
+            donatorTierPromise = null;
+        }
+    })();
+
+    return donatorTierPromise;
+};
+
+export const loadSettings = async () => {
+    return new Promise((resolve, reject) => {
+        const defaultSettings = {};
+        const forcedSettings = {};
+        for (const category of Object.values(SETTINGS_CONFIG)) {
+            for (const [settingName, settingDef] of Object.entries(
+                category.settings,
+            )) {
+                if (settingDef.default !== undefined) {
+                    defaultSettings[settingName] = settingDef.default;
+                }
+                if (isUnavailableSetting(settingDef)) {
+                    forcedSettings[settingName] = false;
+                }
+                if (settingDef.childSettings) {
+                    for (const [childName, childSettingDef] of Object.entries(
+                        settingDef.childSettings,
+                    )) {
+                        if (isUnavailableSetting(childSettingDef)) {
+                            forcedSettings[childName] = false;
+                        }
+                        if (childSettingDef.default !== undefined) {
+                            defaultSettings[childName] =
+                                childSettingDef.default;
+                        }
+                    }
+                }
+            }
+        }
+
+        chrome.storage.local.get(
+            { ...defaultSettings, [REMOTE_SETTING_LOCKS_KEY]: {} },
+            async (settings) => {
+                if (chrome.runtime.lastError) {
+                    console.error(
+                        'Failed to load settings:',
+                        chrome.runtime.lastError,
+                    );
+                    reject(chrome.runtime.lastError);
+                } else {
+                    const remoteLocks =
+                        settings[REMOTE_SETTING_LOCKS_KEY] || {};
+                    delete settings[REMOTE_SETTING_LOCKS_KEY];
+
+                    if (settings[REMOTE_SETTING_OVERRIDE_KEY] !== true) {
+                        for (const key of Object.keys(remoteLocks)) {
+                            forcedSettings[key] = false;
+                        }
+                    }
+
+                    for (const [key, value] of Object.entries(forcedSettings)) {
+                        settings[key] = value;
+                    }
+
+                    const authenticatedUserId = await getAuthenticatedUserId();
+                    settings[PROFILE_PRONOUNS_SETTING_NAME] =
+                        await getProfilePronounsForUser(authenticatedUserId);
+                    resolve(settings);
+                }
+            },
+        );
+    });
+};
+
+export const enforceSettingOverrides = async () => {
+    try {
+        const settings = await loadSettings();
+        const settingNames = [];
+        for (const category of Object.values(SETTINGS_CONFIG)) {
+            for (const [settingName, config] of Object.entries(
+                category.settings,
+            )) {
+                settingNames.push(settingName);
+                if (config.childSettings) {
+                    settingNames.push(...Object.keys(config.childSettings));
+                }
+            }
+        }
+        const storedSettings = await chrome.storage.local.get([
+            ...settingNames,
+            'rovalra_settings',
+        ]);
+        const bundledSettings = storedSettings.rovalra_settings || {};
+        const getStoredSetting = (name) =>
+            Object.prototype.hasOwnProperty.call(storedSettings, name)
+                ? storedSettings[name]
+                : bundledSettings[name];
+        const data = await chrome.storage.local.get([
+            'profile3DRenderForceDisabled',
+        ]);
+        const userTier = currentUserTier;
+        const overrides = {};
+
+        const is3DLocked =
+            data.profile3DRenderForceDisabled === true &&
+            !settings.profile3DRenderBypassCheck;
+        if (is3DLocked && settings.profile3DRenderEnabled === true) {
+            overrides.profile3DRenderEnabled = false;
+        }
+
+        for (const category of Object.values(SETTINGS_CONFIG)) {
+            for (const [settingName, config] of Object.entries(
+                category.settings,
+            )) {
+                const processSetting = (name, conf) => {
+                    /*if (conf.donatorTier) {
+                        const isLocked = userTier < conf.donatorTier;
+                        if (isLocked && settings[name] === true) {
+                            overrides[name] = false;
+                        }
+                        }*/ // Broken as it would always turn checkboxes off
+                    if (
+                        (conf.locked || conf.deprecated) &&
+                        getStoredSetting(name) === true
+                    ) {
+                        overrides[name] = false;
+                    }
+                };
+
+                processSetting(settingName, config);
+
+                if (config.childSettings) {
+                    for (const [childName, childConfig] of Object.entries(
+                        config.childSettings,
+                    )) {
+                        processSetting(childName, childConfig);
+                    }
+                }
+            }
+        }
+
+        const overrideKeys = Object.keys(overrides);
+        if (overrideKeys.length > 0) {
+            console.log(
+                `RoValra: Enforcing ${overrideKeys.length} setting override(s) at startup:`,
+                overrideKeys,
+            );
+
+            return new Promise((resolve) => {
+                chrome.storage.local.set(overrides, () => {
+                    if (chrome.runtime.lastError) {
+                        console.error(
+                            'RoValra: Failed to enforce setting overrides',
+                            chrome.runtime.lastError,
+                        );
+                        resolve();
+                        return;
+                    }
+
+                    chrome.storage.local.get('rovalra_settings', (result) => {
+                        const settingsData = result.rovalra_settings || {};
+                        let changed = false;
+                        for (const [key, value] of Object.entries(overrides)) {
+                            if (settingsData[key] !== value) {
+                                settingsData[key] = value;
+                                changed = true;
+                            }
+                        }
+                        if (changed) {
+                            chrome.storage.local.set(
+                                { rovalra_settings: settingsData },
+                                () => {
+                                    resolve();
+                                },
+                            );
+                        } else {
+                            resolve();
+                        }
+                    });
+                });
+            });
+        }
+    } catch (error) {
+        console.error('RoValra: Failed to enforce setting overrides:', error);
+    }
+};
+
+export const handleSaveSettings = async (settingName, value) => {
+    if (!settingName) {
+        console.error('No setting name provided');
+        return Promise.reject(new Error('No setting name provided'));
+    }
+
+    try {
+        const [remoteLocks, remoteOverride] = await Promise.all([
+            getRemoteSettingLocks(),
+            chrome.storage.local.get({
+                [REMOTE_SETTING_OVERRIDE_KEY]: false,
+            }),
+        ]);
+        if (
+            remoteLocks[settingName] &&
+            value !== false &&
+            remoteOverride[REMOTE_SETTING_OVERRIDE_KEY] !== true
+        ) {
+            value = false;
+        }
+
+        const settingConfig = findSettingConfig(settingName);
+
+        let sanitizedValue = value;
+        let profilePronounsChanged = false;
+        let profilePronounsSyncFailed = false;
+        let profilePronounsUserId = null;
+
+        if (settingConfig) {
+            switch (settingConfig.type) {
+                case 'checkbox':
+                    if (value !== true && value !== false && value !== null) {
+                        console.warn(
+                            `Invalid boolean value for '${settingName}' - coercing to boolean`,
+                        );
+                        sanitizedValue = Boolean(value);
+                    }
+                    break;
+
+                case 'number': {
+                    const numValue = Number(value);
+                    if (isNaN(numValue)) {
+                        console.warn(
+                            `Invalid number value for '${settingName}' - setting to default`,
+                        );
+                        sanitizedValue = settingConfig.default ?? 0;
+                    } else {
+                        sanitizedValue = numValue;
+                        if (
+                            settingConfig.min !== undefined &&
+                            sanitizedValue < settingConfig.min
+                        ) {
+                            sanitizedValue = settingConfig.min;
+                        }
+                        if (
+                            settingConfig.max !== undefined &&
+                            sanitizedValue > settingConfig.max
+                        ) {
+                            sanitizedValue = settingConfig.max;
+                        }
+                    }
+                    break;
+                }
+
+                case 'text':
+                case 'input':
+                case 'select':
+                case 'color':
+                case 'gradient':
+                    if (value === null) {
+                        sanitizedValue = null;
+                    } else if (typeof value === 'string') {
+                        if (settingConfig.validateHttpUrl) {
+                            const normalizedUrl =
+                                normalizeHttpUrlSetting(value);
+                            if (normalizedUrl === INVALID_HTTP_URL) {
+                                await restoreTextSettingInput(settingName);
+                                showSystemAlert(
+                                    ts('settings.ui.controls.invalidImageUrl'),
+                                    'warning',
+                                );
+                                return;
+                            }
+                            sanitizedValue = normalizedUrl;
+                            await restoreTextSettingInputValue(
+                                settingName,
+                                sanitizedValue,
+                            );
+                            break;
+                        }
+
+                        sanitizedValue = sanitizeString(value);
+
+                        if (settingConfig.trim) {
+                            sanitizedValue = sanitizedValue.trim();
+                        }
+
+                        sanitizedValue = applyCharacterReplacements(
+                            sanitizedValue,
+                            settingConfig.characterReplacements,
+                        );
+
+                        if (settingConfig.replaceSpecialCharactersWithPipe) {
+                            sanitizedValue =
+                                replacePronounSpecialCharacters(sanitizedValue);
+                        }
+
+                        if (
+                            Number.isInteger(settingConfig.maxLength) &&
+                            settingConfig.maxLength > 0
+                        ) {
+                            sanitizedValue = settingConfig.useGraphemeLength
+                                ? truncateProfilePronouns(
+                                      sanitizedValue,
+                                      settingConfig.maxLength,
+                                  )
+                                : sanitizedValue.slice(
+                                      0,
+                                      settingConfig.maxLength,
+                                  );
+                        }
+
+                        if (
+                            settingConfig.type === 'select' &&
+                            settingConfig.options
+                        ) {
+                            let validValues = [];
+                            if (settingConfig.options === 'REGIONS') {
+                                validValues = ['AUTO', ...Object.keys(REGIONS)];
+                            } else if (settingConfig.options === 'BORDERS') {
+                                validValues = [];
+                            } else if (Array.isArray(settingConfig.options)) {
+                                validValues = settingConfig.options.map(
+                                    (opt) =>
+                                        typeof opt === 'object'
+                                            ? opt.value
+                                            : opt,
+                                );
+                            }
+
+                            if (
+                                validValues.length > 1 &&
+                                !validValues.includes(sanitizedValue)
+                            ) {
+                                console.warn(
+                                    `Invalid select value '${sanitizedValue}' for '${settingName}' - setting to default`,
+                                );
+                                sanitizedValue =
+                                    settingConfig.default ?? validValues[0];
+                            }
+                        }
+                    } else if (
+                        settingConfig.type === 'gradient' &&
+                        typeof value === 'object'
+                    ) {
+                        sanitizedValue = {
+                            enabled: value.enabled !== false,
+                            color1: sanitizeString(
+                                String(value.color1 || '#667eea'),
+                            ),
+                            color2: sanitizeString(
+                                String(value.color2 || '#764ba2'),
+                            ),
+                            angle: Math.max(
+                                0,
+                                Math.min(360, parseInt(value.angle, 10) || 0),
+                            ),
+                            fade: Math.max(
+                                0,
+                                Math.min(100, parseInt(value.fade, 10) || 0),
+                            ),
+                        };
+                        if (
+                            settingConfig.colorCount >= 3 ||
+                            settingConfig.default?.color3
+                        ) {
+                            sanitizedValue.color3 = sanitizeString(
+                                String(
+                                    value.color3 ||
+                                        settingConfig.default?.color3 ||
+                                        '#f093fb',
+                                ),
+                            );
+                        }
+                    } else {
+                        console.warn(
+                            `Invalid string value for '${settingName}' - converting to string and sanitizing`,
+                        );
+                        sanitizedValue = sanitizeString(String(value));
+                    }
+                    break;
+
+                case 'list':
+                    if (Array.isArray(value)) {
+                        sanitizedValue = value.map((item) =>
+                            typeof item === 'string'
+                                ? sanitizeString(item)
+                                : '',
+                        );
+                    } else {
+                        console.warn(
+                            `Invalid array value for list setting '${settingName}' - setting to default`,
+                        );
+                        sanitizedValue = settingConfig.default ?? [];
+                    }
+                    break;
+
+                case 'file':
+                    if (value === null) {
+                        sanitizedValue = null;
+                    } else if (
+                        typeof value !== 'string' ||
+                        !value.startsWith('data:')
+                    ) {
+                        console.warn(
+                            `Invalid data URI for file setting '${settingName}'`,
+                        );
+                        sanitizedValue = null;
+                    } else {
+                        const accept = settingConfig.accept || 'image/*';
+                        if (
+                            accept.includes('image') &&
+                            !value.startsWith('data:image/')
+                        ) {
+                            console.warn(
+                                `Attempted to save non-image data to an image file setting: '${settingName}'`,
+                            );
+                            sanitizedValue = null;
+                        }
+                    }
+                    break;
+
+                case 'backgroundImage':
+                    sanitizedValue = sanitizeBackgroundImage(value);
+                    break;
+            }
+        }
+
+        if (settingName === PROFILE_PRONOUNS_SETTING_NAME) {
+            const pronounsUpdate =
+                await prepareProfilePronounsUpdate(sanitizedValue);
+            if (!pronounsUpdate.shouldSave) return;
+
+            sanitizedValue = pronounsUpdate.value;
+            profilePronounsChanged = pronounsUpdate.changed;
+            profilePronounsSyncFailed = pronounsUpdate.syncFailed;
+            profilePronounsUserId = pronounsUpdate.userId;
+        }
+
+        const settings = { [settingName]: sanitizedValue };
+
+        return new Promise((resolve, reject) => {
+            chrome.storage.local.set(settings, () => {
+                if (chrome.runtime.lastError) {
+                    console.error(
+                        'Failed to save setting:',
+                        settingName,
+                        chrome.runtime.lastError,
+                    );
+                    reject(chrome.runtime.lastError);
+                } else {
+                    if (settingName === PROFILE_PRONOUNS_SETTING_NAME) {
+                        setProfilePronounsForUser(
+                            profilePronounsUserId,
+                            sanitizedValue,
+                        ).catch((error) =>
+                            console.warn(
+                                'RoValra: Failed to save account-scoped pronouns.',
+                                error,
+                            ),
+                        );
+                    }
+                    syncToSettingsKey(settingName, sanitizedValue);
+                    if (
+                        settingName === REMOTE_SETTING_OVERRIDE_KEY &&
+                        sanitizedValue === true
+                    ) {
+                        refreshRemoteSettingLocks().catch((error) =>
+                            console.warn(
+                                'RoValra: Failed to restore remotely disabled settings for developer override.',
+                                error,
+                            ),
+                        );
+                    }
+                    if (settingName === 'profileGradient' && sanitizedValue) {
+                        if (gradientSyncTimeout)
+                            clearTimeout(gradientSyncTimeout);
+                        gradientSyncTimeout = setTimeout(async () => {
+                            const isDonator = currentUserTier >= 2;
+                            if (isDonator) {
+                                const val = sanitizedValue.enabled
+                                    ? `${sanitizedValue.color1}, ${sanitizedValue.color2}, ${sanitizedValue.fade}, ${sanitizedValue.angle}`
+                                    : '';
+
+                                updateUserSettingViaApi('gradient', val).catch(
+                                    (error) =>
+                                        console.error(
+                                            'RoValra: Gradient sync failed',
+                                            error,
+                                        ),
+                                );
+                            }
+                        }, 1000);
+                    }
+                    if (
+                        settingName === 'displayNameGradientEnabled' ||
+                        settingName === 'displayNameGradient' ||
+                        settingName === 'displayNameGradientEffect'
+                    ) {
+                        queueGradientNameSync({
+                            [settingName]: sanitizedValue,
+                        });
+                    }
+                    if (settingName === 'avatarBorderChoice') {
+                        const isDonator = currentUserTier >= 3;
+                        if (isDonator) {
+                            getBorders().then((borders) => {
+                                const borderEntry = borders.find(
+                                    (b) => b.value === sanitizedValue,
+                                );
+                                const borderUrl =
+                                    borderEntry && borderEntry.link
+                                        ? borderEntry.link
+                                        : '';
+                                updateUserSettingViaApi(
+                                    'border',
+                                    borderUrl,
+                                ).catch((error) =>
+                                    console.error(
+                                        'RoValra: Border sync failed',
+                                        error,
+                                    ),
+                                );
+                            });
+                        }
+                    }
+                    if (settingName === 'profileViewsEnabled') {
+                        loadSettings()
+                            .then((currentSettings) => {
+                                return updateUserSettingViaApi(
+                                    'hide_views',
+                                    !currentSettings.profileViewsEnabled,
+                                );
+                            })
+                            .catch((error) =>
+                                console.error(
+                                    'RoValra: Profile views visibility sync failed',
+                                    error,
+                                ),
+                            );
+                    }
+
+                    document.dispatchEvent(
+                        new CustomEvent('rovalra:settingSaved', {
+                            detail: {
+                                name: settingName,
+                                value: sanitizedValue,
+                            },
+                        }),
+                    );
+
+                    if (profilePronounsChanged || profilePronounsSyncFailed) {
+                        showSystemAlert(
+                            profilePronounsSyncFailed
+                                ? 'Pronouns saved locally, but public API sync is currently unavailable.'
+                                : sanitizedValue
+                                  ? 'Pronouns updated!'
+                                  : 'Pronouns removed successfully!',
+                            profilePronounsSyncFailed ? 'warning' : 'success',
+                        );
+                    }
+
+                    resolve();
+                }
+            });
+        });
+    } catch (error) {
+        console.error(`Error saving setting ${settingName}:`, error);
+        return Promise.reject(error);
+    }
+};
+
+const syncToSettingsKey = (settingName, value) => {
+    settingsKeySyncQueue = settingsKeySyncQueue
+        .catch(() => {})
+        .then(
+            () =>
+                new Promise((resolve, reject) => {
+                    chrome.storage.local.get('rovalra_settings', (result) => {
+                        if (chrome.runtime.lastError) {
+                            reject(chrome.runtime.lastError);
+                            return;
+                        }
+
+                        const settingsData = result.rovalra_settings || {};
+                        settingsData[settingName] = value;
+                        chrome.storage.local.set(
+                            { rovalra_settings: settingsData },
+                            () => {
+                                if (chrome.runtime.lastError) {
+                                    reject(chrome.runtime.lastError);
+                                } else {
+                                    resolve();
+                                }
+                            },
+                        );
+                    });
+                }),
+        );
+
+    return settingsKeySyncQueue;
+};
+
+export const buildSettingsKey = async () => {
+    return new Promise((resolve) => {
+        const allSettingKeys = [];
+        for (const category of Object.values(SETTINGS_CONFIG)) {
+            for (const [settingName, settingDef] of Object.entries(
+                category.settings,
+            )) {
+                allSettingKeys.push(settingName);
+                if (settingDef.childSettings) {
+                    for (const childName of Object.keys(
+                        settingDef.childSettings,
+                    )) {
+                        allSettingKeys.push(childName);
+                    }
+                }
+            }
+        }
+
+        chrome.storage.local.get(allSettingKeys, (currentSettings) => {
+            chrome.storage.local.set(
+                { rovalra_settings: currentSettings },
+                () => {
+                    if (chrome.runtime.lastError) {
+                        console.error(
+                            'Failed to build settings key:',
+                            chrome.runtime.lastError,
+                        );
+                    } else {
+                        console.log('RoValra: Settings key initialized');
+                    }
+                    resolve();
+                },
+            );
+        });
+    });
+};
+
+export const initSettings = async (settingsContent) => {
+    if (!settingsContent) {
+        console.error(
+            'settingsContent is null in initSettings! Check HTML structure.',
+        );
+        return;
+    }
+    const settings = await loadSettings();
+
+    if (settings) {
+        for (const sectionName in SETTINGS_CONFIG) {
+            const section = SETTINGS_CONFIG[sectionName];
+            for (const [settingName, config] of Object.entries(
+                section.settings,
+            )) {
+                const validatePerms = async (name, conf) => {
+                    if (settings[name] === true && conf.requiredPermissions) {
+                        let missingPerms = false;
+
+                        for (const perm of conf.requiredPermissions) {
+                            const hasIt = await hasPermission(perm);
+                            if (!hasIt) {
+                                missingPerms = true;
+                                break;
+                            }
+                        }
+
+                        if (missingPerms) {
+                            console.log(
+                                `RoValra: Disabling '${name}' because required permissions are missing.`,
+                            );
+                            await handleSaveSettings(name, false);
+                            settings[name] = false;
+                        }
+                    }
+                };
+
+                await validatePerms(settingName, config);
+                if (config.childSettings) {
+                    for (const [childName, childConfig] of Object.entries(
+                        config.childSettings,
+                    )) {
+                        await validatePerms(childName, childConfig);
+                    }
+                }
+            }
+        }
+    }
+
+    if (settings) {
+        updateConditionalSettingsVisibility(settingsContent, settings);
+        for (const sectionName in SETTINGS_CONFIG) {
+            const section = SETTINGS_CONFIG[sectionName];
+            for (const [settingName, setting] of Object.entries(
+                section.settings,
+            )) {
+                const element = settingsContent.querySelector(
+                    `#${settingName}`,
+                );
+                if (element) {
+                    if (setting.type === 'checkbox') {
+                        element.checked =
+                            settings[settingName] !== undefined
+                                ? settings[settingName]
+                                : setting.default;
+                    } else if (setting.type === 'select') {
+                        const savedValue =
+                            settings[settingName] || setting.default;
+                        element.value = savedValue;
+
+                        if (element._dropdownApi) {
+                            element._dropdownApi.setValue(savedValue);
+                        }
+                    } else if (setting.type === 'gradient') {
+                        if (element.rovalraGradientApi) {
+                            element.rovalraGradientApi.setValue(
+                                settings[settingName] || setting.default,
+                            );
+                        }
+                    } else if (
+                        setting.type === 'input' ||
+                        setting.type === 'color'
+                    ) {
+                        const savedValue = settings[settingName] || '';
+                        element.value = setting.maxLength
+                            ? String(savedValue).slice(0, setting.maxLength)
+                            : savedValue;
+                        element.dispatchEvent(
+                            new Event('input', { bubbles: true }),
+                        );
+                    } else if (setting.type === 'file') {
+                        const fileUploadWrapper = settingsContent.querySelector(
+                            `[data-setting-name="${settingName}"]`,
+                        );
+                        const previewElement = settingsContent.querySelector(
+                            `#preview-${settingName}`,
+                        );
+                        const customLogoData = settings[settingName];
+
+                        if (
+                            fileUploadWrapper &&
+                            fileUploadWrapper.rovalraFileUpload
+                        ) {
+                            const { setFileName, showClear } =
+                                fileUploadWrapper.rovalraFileUpload;
+                            if (customLogoData) {
+                                setFileName('custom_icon.png');
+                                showClear(true);
+                                if (previewElement) {
+                                    previewElement.src = customLogoData;
+                                    previewElement.style.display = 'block';
+                                }
+                            } else {
+                                setFileName(null);
+                                showClear(false);
+                                if (previewElement)
+                                    previewElement.style.display = 'none';
+                            }
+                        } else {
+                            if (previewElement && settings[settingName]) {
+                                previewElement.src = settings[settingName];
+                                previewElement.style.display = 'block';
+                            } else if (previewElement) {
+                                previewElement.src = '#';
+                                previewElement.style.display = 'none';
+                            }
+                        }
+                    }
+                }
+
+                if (setting.childSettings) {
+                    for (const [childName, childSetting] of Object.entries(
+                        setting.childSettings,
+                    )) {
+                        const childElement = settingsContent.querySelector(
+                            `#${childName}`,
+                        );
+                        if (childElement) {
+                            if (childSetting.type === 'checkbox') {
+                                childElement.checked =
+                                    settings[childName] !== undefined
+                                        ? settings[childName]
+                                        : childSetting.default;
+                            } else if (childSetting.type === 'select') {
+                                const savedValue =
+                                    settings[childName] || childSetting.default;
+                                childElement.value = savedValue;
+
+                                if (childElement._dropdownApi) {
+                                    childElement._dropdownApi.setValue(
+                                        savedValue,
+                                    );
+                                }
+
+                                if (
+                                    childName === 'robloxPreferredRegion' &&
+                                    childElement.options.length === 0
+                                ) {
+                                    Object.keys(REGIONS).forEach(
+                                        (regionCode) => {
+                                            const option =
+                                                document.createElement(
+                                                    'option',
+                                                );
+                                            option.value = regionCode;
+                                            option.textContent =
+                                                regionCode === 'AUTO'
+                                                    ? ts('regionSelector.automatic')
+                                                    : getFullRegionName(regionCode);
+                                            childElement.appendChild(option);
+                                        },
+                                    );
+                                }
+                            } else if (childSetting.type === 'gradient') {
+                                if (childElement.rovalraGradientApi) {
+                                    childElement.rovalraGradientApi.setValue(
+                                        settings[childName] ||
+                                            childSetting.default,
+                                    );
+                                }
+                            } else if (
+                                childSetting.type === 'input' ||
+                                childSetting.type === 'color'
+                            ) {
+                                const savedValue = settings[childName] || '';
+                                childElement.value = childSetting.maxLength
+                                    ? String(savedValue).slice(
+                                          0,
+                                          childSetting.maxLength,
+                                      )
+                                    : savedValue;
+                                childElement.dispatchEvent(
+                                    new Event('input', { bubbles: true }),
+                                );
+                            } else if (childSetting.type === 'list') {
+                                const values = settings[childName] ||
+                                    childSetting.default || [''];
+                                if (
+                                    childElement.rovalraList &&
+                                    typeof childElement.rovalraList
+                                        .setValues === 'function'
+                                ) {
+                                    childElement.rovalraList.setValues(values);
+                                }
+                            } else if (childSetting.type === 'number') {
+                                const currentValue =
+                                    settings[childName] !== undefined
+                                        ? settings[childName]
+                                        : childSetting.default;
+                                childElement.value = currentValue;
+                                const toggleElement =
+                                    settingsContent.querySelector(
+                                        `#${childName}-enabled`,
+                                    );
+                                if (toggleElement) {
+                                    const isEnabled = currentValue > 0;
+                                    toggleElement.checked = isEnabled;
+                                }
+                            } else if (childSetting.type === 'file') {
+                                const previewElement =
+                                    settingsContent.querySelector(
+                                        `#preview-${childName}`,
+                                    );
+                                const clearButton =
+                                    settingsContent.querySelector(
+                                        `#clear-${childName}`,
+                                    );
+                                if (previewElement && settings[childName]) {
+                                    previewElement.src = settings[childName];
+                                    previewElement.style.display = 'block';
+                                    if (clearButton)
+                                        clearButton.style.display =
+                                            'inline-block';
+                                } else if (previewElement) {
+                                    previewElement.style.display = 'none';
+                                    if (clearButton)
+                                        clearButton.style.display = 'none';
+                                }
+                            } else if (childSetting.type === 'button') {
+                                // No state to restore from settings
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        await checkSettingLocks(settingsContent, settings);
+        if (document.querySelector('.permission-manager')) {
+            updateAllPermissionToggles();
+        }
+    }
+    settingsContent.querySelectorAll('.permission-toggle').forEach((toggle) => {
+        toggle.addEventListener('change', handlePermissionToggle);
+    });
+};
+
+export const applyLockedState = (
+    settingName,
+    parentElement,
+    isLocked,
+    reason = '',
+    isDonatorLock = false,
+) => {
+    const inputElement = parentElement.querySelector(
+        `[data-setting-name="${settingName}"]`,
+    );
+    if (!inputElement) return;
+
+    const wrapper =
+        inputElement.closest('.child-setting-item') ||
+        inputElement.closest('.setting');
+    if (!wrapper) return;
+
+    const existingNotice = wrapper.querySelector('.rovalra-lock-notice');
+    if (existingNotice) existingNotice.remove();
+
+    if (isLocked || isDonatorLock) {
+        const config = findSettingConfig(settingName);
+        const lockType = config?.isPermanent ? 'permanently' : 'temporarily';
+
+        if (isLocked) {
+            wrapper.classList.add('setting-locked');
+            wrapper.style.setProperty('opacity', '1', 'important');
+            wrapper.style.setProperty('pointer-events', 'none', 'important');
+        } else {
+            wrapper.classList.remove('setting-locked');
+            wrapper.style.removeProperty('opacity');
+            if (!wrapper.classList.contains('disabled-setting')) {
+                wrapper.style.setProperty('pointer-events', 'auto');
+            }
+        }
+
+        if (isDonatorLock) {
+            wrapper.classList.add('donator-locked');
+        }
+
+        const notice = document.createElement('div');
+        notice.className = 'rovalra-lock-notice';
+        if (isDonatorLock) {
+            notice.classList.add('donator-notice');
+            if (!isLocked) notice.classList.add('unlocked-donator-notice');
+        }
+
+        const statusLine = document.createElement('div');
+        statusLine.className = 'lock-status-text';
+        if (isDonatorLock) {
+            const tier = config?.donatorTier || '';
+            statusLine.textContent = isLocked
+                ? ts('settings.ui.locks.donatorTierRequired', { tier })
+                : ts('settings.ui.locks.donatorPerk', { tier });
+        } else {
+            statusLine.textContent = ts('settings.ui.locks.featureDisabled', {
+                lockType,
+            });
+        }
+
+        const reasonLine = document.createElement('div');
+        reasonLine.className = 'lock-reason-text';
+        reasonLine.textContent = reason;
+
+        notice.append(statusLine, reasonLine);
+        wrapper.prepend(notice);
+
+        if (isLocked) {
+            Array.from(wrapper.children).forEach((child) => {
+                if (!child.classList.contains('rovalra-lock-notice')) {
+                    child.style.opacity = '0.5';
+                }
+            });
+
+            wrapper.querySelectorAll('input, select, button').forEach((el) => {
+                if (!el.dataset.forceEnabled) {
+                    el.disabled = true;
+                }
+            });
+        } else {
+            Array.from(wrapper.children).forEach((child) => {
+                child.style.opacity = '';
+            });
+
+            wrapper.querySelectorAll('input, select, button').forEach((el) => {
+                if (
+                    !wrapper.classList.contains('disabled-setting') &&
+                    !wrapper.classList.contains('setting-locked')
+                ) {
+                    el.disabled = false;
+                }
+            });
+        }
+    } else {
+        wrapper.classList.remove('setting-locked');
+        wrapper.classList.remove('donator-locked');
+        wrapper.style.removeProperty('opacity');
+        wrapper.style.removeProperty('filter');
+        if (!wrapper.classList.contains('disabled-setting')) {
+            wrapper.style.setProperty('pointer-events', 'auto');
+        }
+
+        Array.from(wrapper.children).forEach((child) => {
+            child.style.opacity = '';
+        });
+
+        wrapper.querySelectorAll('input, select, button').forEach((el) => {
+            if (
+                !wrapper.classList.contains('disabled-setting') &&
+                !wrapper.classList.contains('setting-locked')
+            ) {
+                el.disabled = false;
+            }
+        });
+    }
+};
+
+export const checkSettingLocks = async (settingsContent, currentSettings) => {
+    const data = await chrome.storage.local.get([
+        'profile3DRenderForceDisabled',
+    ]);
+    const remoteLocks = await getRemoteSettingLocks();
+    const remoteOverride =
+        currentSettings[REMOTE_SETTING_OVERRIDE_KEY] === true;
+
+    const userTier = currentUserTier;
+
+    const is3DLocked =
+        data.profile3DRenderForceDisabled === true &&
+        !currentSettings.profile3DRenderBypassCheck;
+
+    if (is3DLocked && currentSettings.profile3DRenderEnabled === true) {
+        await handleSaveSettings('profile3DRenderEnabled', false);
+    }
+
+    applyLockedState(
+        'profile3DRenderEnabled',
+        settingsContent,
+        is3DLocked,
+        'The 3D Profile Renderer was forcefully disabled because WebGL 2 is disabled or your graphics card doesnt support it.',
+    );
+
+    for (const category of Object.values(SETTINGS_CONFIG)) {
+        for (const [settingName, config] of Object.entries(category.settings)) {
+            const processSetting = async (name, conf) => {
+                if (remoteLocks[name] && !remoteOverride) {
+                    if (currentSettings[name] !== false) {
+                        await handleSaveSettings(name, false);
+                    }
+                    applyLockedState(
+                        name,
+                        settingsContent,
+                        true,
+                        remoteLocks[name].reason || REMOTE_SETTING_LOCK_REASON,
+                    );
+                    return true;
+                }
+                let handledLockState = false;
+                if (conf.donatorTier) {
+                    const isLocked = userTier < conf.donatorTier;
+                    applyLockedState(
+                        name,
+                        settingsContent,
+                        isLocked,
+                        conf.donatorReason ||
+                            'This is a donator-exclusive feature.',
+                        true,
+                    );
+                    if (isLocked) return true;
+                    handledLockState = true;
+                }
+                if (conf.locked) {
+                    if (currentSettings[name] === true) {
+                        await handleSaveSettings(name, false);
+                    }
+                    applyLockedState(name, settingsContent, true, conf.locked);
+                    return true;
+                }
+                if (!handledLockState) {
+                    applyLockedState(name, settingsContent, false);
+                }
+                return false;
+            };
+
+            await processSetting(settingName, config);
+
+            if (config.childSettings) {
+                for (const [childName, childConfig] of Object.entries(
+                    config.childSettings,
+                )) {
+                    await processSetting(childName, childConfig);
+                }
+            }
+        }
+    }
+};
+
+if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+    chrome.storage.onChanged.addListener(async (changes, areaName) => {
+        if (areaName !== 'local' || !changes[REMOTE_SETTING_LOCKS_KEY]) return;
+
+        const settingsContent = document.querySelector(
+            '#setting-section-content',
+        );
+        if (!settingsContent) return;
+
+        const currentSettings = await loadSettings();
+        updateConditionalSettingsVisibility(settingsContent, currentSettings);
+        await checkSettingLocks(settingsContent, currentSettings);
+    });
+}
+
+function applyDisabledState(
+    settingName,
+    parentElement,
+    isDisabled,
+    isPermissionRelated = false,
+) {
+    const inputElement = parentElement.querySelector(
+        `[data-setting-name="${settingName}"]`,
+    );
+    if (!inputElement) return;
+
+    const wrapper =
+        inputElement.closest('.child-setting-item') ||
+        inputElement.closest('.setting');
+    if (!wrapper) return;
+
+    const toggleSwitch = wrapper.querySelector(
+        '.setting-controls > .toggle-switch',
+    );
+
+    if (isDisabled && isPermissionRelated) {
+        if (toggleSwitch) {
+            toggleSwitch.style.opacity = '0.5';
+            toggleSwitch.style.setProperty(
+                'pointer-events',
+                'none',
+                'important',
+            );
+        }
+        if (inputElement.type === 'checkbox') inputElement.disabled = true;
+    } else if (isDisabled) {
+        wrapper.classList.add('disabled-setting');
+        wrapper.style.opacity = '0.5';
+        wrapper.style.setProperty('pointer-events', 'none', 'important');
+        wrapper.querySelectorAll('input, select, button').forEach((el) => {
+            el.disabled = true;
+        });
+    } else {
+        wrapper.classList.remove('disabled-setting');
+        wrapper.style.opacity = '1';
+        if (!wrapper.classList.contains('setting-locked')) {
+            wrapper.style.setProperty('pointer-events', 'auto');
+        }
+        wrapper.querySelectorAll('input, select, button').forEach((el) => {
+            if (!wrapper.classList.contains('setting-locked')) {
+                el.disabled = false;
+            }
+        });
+        if (toggleSwitch) {
+            toggleSwitch.style.opacity = '1';
+            if (!wrapper.classList.contains('setting-locked')) {
+                toggleSwitch.style.setProperty('pointer-events', 'auto');
+            }
+        }
+    }
+}
+
+export function updateConditionalSettingsVisibility(
+    settingsContent,
+    currentSettings,
+) {
+    if (!settingsContent || !currentSettings) {
+        return;
+    }
+
+    const settingsToDisable = new Set();
+    const settingsToHide = new Set();
+
+    for (const [settingName, isEnabled] of Object.entries(currentSettings)) {
+        const config = findSettingConfig(settingName);
+        if (!config) continue;
+
+        if (config.childSettings) {
+            for (const [childName, childConfig] of Object.entries(
+                config.childSettings,
+            )) {
+                if (childConfig.condition) {
+                    if (
+                        currentSettings[childConfig.condition.parent] !==
+                        childConfig.condition.value
+                    ) {
+                        if (childConfig.condition.hide !== false) {
+                            settingsToHide.add(childName);
+                        }
+                        settingsToDisable.add(childName);
+                    } else if (
+                        config.type === 'checkbox' &&
+                        !config.keepChildSettingsEnabled &&
+                        !isEnabled
+                    ) {
+                        settingsToDisable.add(childName);
+                    }
+                } else if (
+                    config.type === 'checkbox' &&
+                    !config.keepChildSettingsEnabled &&
+                    !isEnabled
+                ) {
+                    settingsToDisable.add(childName);
+                }
+            }
+        }
+    }
+
+    const allSettingElements = settingsContent.querySelectorAll(
+        '[data-setting-name]',
+    );
+    allSettingElements.forEach((element) => {
+        const settingName = element.dataset.settingName;
+        const wrapper =
+            element.closest('.child-setting-item') ||
+            element.closest('.setting');
+        if (wrapper) {
+            wrapper.style.display = settingsToHide.has(settingName)
+                ? 'none'
+                : '';
+        }
+
+        const separator = settingsContent.querySelector(
+            `.child-setting-separator[data-child-setting-name="${settingName}"]`,
+        );
+        if (separator) {
+            separator.style.display = settingsToHide.has(settingName)
+                ? 'none'
+                : '';
+        }
+
+        applyDisabledState(
+            settingName,
+            settingsContent,
+            settingsToDisable.has(settingName),
+        );
+    });
+
+    const numberToggles = settingsContent.querySelectorAll(
+        'input[type="checkbox"][data-controls-setting]',
+    );
+    numberToggles.forEach((toggle) => {
+        const controlledSettingName = toggle.dataset.controlsSetting;
+        const numberInputContainer = settingsContent
+            .querySelector(`#${controlledSettingName}`)
+            ?.closest('.rovalra-number-input-container');
+        if (numberInputContainer) {
+            const isDisabled = !toggle.checked;
+            numberInputContainer.style.opacity = isDisabled ? '0.5' : '1';
+            numberInputContainer.style.pointerEvents = isDisabled
+                ? 'none'
+                : 'auto';
+            numberInputContainer
+                .querySelectorAll('input, button')
+                .forEach((el) => (el.disabled = isDisabled));
+        }
+    });
+}
+
+async function hasPermission(permission) {
+    return new Promise((resolve) => {
+        chrome.runtime.sendMessage(
+            { action: 'checkPermission', permission: permission },
+            (response) => {
+                if (chrome.runtime.lastError) {
+                    console.error(
+                        'RoValra: Error checking permission:',
+                        chrome.runtime.lastError.message,
+                    );
+                    resolve(false);
+                }
+                resolve(response?.granted || false);
+            },
+        );
+    });
+}
+
+async function requestPermission(permission) {
+    return new Promise((resolve) => {
+        chrome.runtime.sendMessage(
+            { action: 'requestPermission', permission: permission },
+            (response) => {
+                if (chrome.runtime.lastError) {
+                    console.warn(
+                        `RoValra: Permission request for '${permission}' failed or was dismissed:`,
+                        chrome.runtime.lastError.message,
+                    );
+                    resolve(false);
+                }
+                resolve(response?.granted || false);
+            },
+        );
+    });
+}
+
+async function revokePermission(permission) {
+    return new Promise((resolve) => {
+        chrome.runtime.sendMessage(
+            { action: 'revokePermission', permission: permission },
+            (response) => {
+                if (chrome.runtime.lastError) {
+                    console.error(
+                        `RoValra: Failed to revoke '${permission}' permission:`,
+                        chrome.runtime.lastError.message,
+                    );
+                    resolve(false);
+                }
+                resolve(response?.revoked || false);
+            },
+        );
+    });
+}
+
+export async function updateAllPermissionToggles() {
+    const settings = await loadSettings();
+    const permissionManagers = document.querySelectorAll('.permission-manager');
+    for (const manager of permissionManagers) {
+        const permissionName = manager.dataset.permissionName;
+        const isGranted = await hasPermission(permissionName);
+
+        const toggle = manager.querySelector('.permission-toggle');
+        if (toggle) {
+            toggle.checked = isGranted;
+        }
+    }
+
+    for (const sectionName in SETTINGS_CONFIG) {
+        const section = SETTINGS_CONFIG[sectionName];
+        for (const [settingName, config] of Object.entries(section.settings)) {
+            const checkAndRefresh = async (name, conf) => {
+                if (settings[name] === true && conf.requiredPermissions) {
+                    let missingPerms = false;
+
+                    for (const perm of conf.requiredPermissions) {
+                        const hasIt = await hasPermission(perm);
+                        if (!hasIt) {
+                            missingPerms = true;
+                            break;
+                        }
+                    }
+
+                    if (missingPerms) {
+                        console.log(
+                            `RoValra: Disabling '${name}' because required permissions are missing.`,
+                        );
+                        await handleSaveSettings(name, false);
+                        settings[name] = false;
+
+                        const element = document.querySelector(`#${name}`);
+                        if (element) {
+                            element.checked = false;
+                        }
+                    }
+                }
+            };
+
+            await checkAndRefresh(settingName, config);
+            if (config.childSettings) {
+                for (const [childName, childConfig] of Object.entries(
+                    config.childSettings,
+                )) {
+                    await checkAndRefresh(childName, childConfig);
+                }
+            }
+        }
+    }
+    updateConditionalSettingsVisibility(document, settings);
+}
+
+export async function handlePermissionToggle(event) {
+    const toggle = event.target;
+    const permissionName = toggle.dataset.permissionName;
+
+    if (toggle.checked) {
+        const granted = await requestPermission(permissionName);
+        if (!granted) {
+            toggle.checked = false;
+        }
+    } else {
+        const wasRevoked = await revokePermission(permissionName);
+        if (!wasRevoked) {
+            toggle.checked = true;
+        }
+    }
+    await updateAllPermissionToggles();
+}
+
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+export function initializeSettingsEventListeners() {
+    document.addEventListener('rovalra:open40methodSetup', () => {
+        createAndShowPopup(() => {
+            // Configuration is saved by the popup.
+        });
+    });
+
+    document.addEventListener('rovalra:openBorderStore', () => {
+        window.location.href =
+            'https://www.roblox.com/my/account?rovalra=store';
+    });
+
+    document.addEventListener('rovalra:openFrameStore', () => {
+        window.location.href =
+            'https://www.roblox.com/my/account?rovalra=store&tab=frames';
+    });
+
+    document.addEventListener('rovalra:generateEnvironmentJson', async () => {
+        const settings = await loadSettings();
+        const envConfig = {};
+
+        // Model
+        if (settings.modelUrl) {
+            envConfig.model = {
+                url: settings.modelUrl,
+                position: [
+                    parseFloat(settings.modelPosX) || 0,
+                    parseFloat(settings.modelPosY) || 0,
+                    parseFloat(settings.modelPosZ) || 0,
+                ],
+                scale: [
+                    parseFloat(settings.modelScaleX) || 1,
+                    parseFloat(settings.modelScaleY) || 1,
+                    parseFloat(settings.modelScaleZ) || 1,
+                ],
+                castShadow: settings.modelCastShadow,
+                receiveShadow: settings.modelReceiveShadow,
+            };
+        }
+
+        const atmosphere = {};
+        if (settings.bgColor) {
+            atmosphere.background = settings.bgColor;
+        }
+        atmosphere.showFloor = settings.showFloor;
+
+        const lights = [];
+        if (settings.ambientLightToggle) {
+            lights.push({
+                type: 'AmbientLight',
+                color: settings.ambientLightColor,
+                intensity: parseFloat(settings.ambientLightIntensity) || 0,
+            });
+        }
+        if (settings.dirLightToggle) {
+            lights.push({
+                type: 'DirectionalLight',
+                color: settings.dirLightColor,
+                intensity: parseFloat(settings.dirLightIntensity) || 0,
+                position: [
+                    parseFloat(settings.dirLightPosX) || 0,
+                    parseFloat(settings.dirLightPosY) || 0,
+                    parseFloat(settings.dirLightPosZ) || 0,
+                ],
+                castShadow: settings.dirLightCastShadow,
+            });
+        }
+        if (lights.length > 0) {
+            atmosphere.lights = lights;
+        }
+
+        if (settings.fogToggle) {
+            atmosphere.fog = {
+                color: settings.fogColor,
+                near: parseFloat(settings.fogNear) || 0,
+                far: parseFloat(settings.fogFar) || 0,
+            };
+        }
+
+        if (Object.keys(atmosphere).length > 0) {
+            envConfig.atmosphere = atmosphere;
+        }
+
+        if (settings.cameraFar) {
+            const far = parseFloat(settings.cameraFar);
+            if (!isNaN(far) && far !== 100) {
+                envConfig.camera = { far: far };
+            }
+        }
+
+        if (settings.tooltipToggle && settings.tooltipText) {
+            envConfig.tooltip = {
+                text: settings.tooltipText,
+                link: settings.tooltipLink || '',
+            };
+        }
+
+        if (
+            settings.skyboxToggle &&
+            settings.skyboxPx &&
+            settings.skyboxNx &&
+            settings.skyboxPy &&
+            settings.skyboxNy &&
+            settings.skyboxPz &&
+            settings.skyboxNz
+        ) {
+            envConfig.skybox = [
+                settings.skyboxPx,
+                settings.skyboxNx,
+                settings.skyboxPy,
+                settings.skyboxNy,
+                settings.skyboxPz,
+                settings.skyboxNz,
+            ];
+        }
+
+        console.log(
+            'Generated Environment JSON:\n' +
+                JSON.stringify(envConfig, null, 2),
+        );
+        alert(ts('settings.ui.environment.exported'));
+    });
+
+    document.addEventListener('rovalra:importEnvironmentJson', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json';
+
+        input.onchange = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = async (readerEvent) => {
+                try {
+                    const config = JSON.parse(readerEvent.target.result);
+                    const updates = {};
+
+                    const set = (key, value) => {
+                        updates[key] = value;
+                    };
+
+                    if (config.model) {
+                        if (config.model.url) set('modelUrl', config.model.url);
+                        if (Array.isArray(config.model.position)) {
+                            set('modelPosX', config.model.position[0]);
+                            set('modelPosY', config.model.position[1]);
+                            set('modelPosZ', config.model.position[2]);
+                        }
+                        if (Array.isArray(config.model.scale)) {
+                            set('modelScaleX', config.model.scale[0]);
+                            set('modelScaleY', config.model.scale[1]);
+                            set('modelScaleZ', config.model.scale[2]);
+                        }
+                        if (typeof config.model.castShadow === 'boolean')
+                            set('modelCastShadow', config.model.castShadow);
+                        if (typeof config.model.receiveShadow === 'boolean')
+                            set(
+                                'modelReceiveShadow',
+                                config.model.receiveShadow,
+                            );
+                    }
+
+                    if (config.atmosphere) {
+                        if (config.atmosphere.background)
+                            set('bgColor', config.atmosphere.background);
+                        if (typeof config.atmosphere.showFloor === 'boolean')
+                            set('showFloor', config.atmosphere.showFloor);
+
+                        set('ambientLightToggle', false);
+                        set('dirLightToggle', false);
+
+                        if (Array.isArray(config.atmosphere.lights)) {
+                            config.atmosphere.lights.forEach((light) => {
+                                if (light.type === 'AmbientLight') {
+                                    set('ambientLightToggle', true);
+                                    if (light.color)
+                                        set('ambientLightColor', light.color);
+                                    if (light.intensity !== undefined)
+                                        set(
+                                            'ambientLightIntensity',
+                                            light.intensity,
+                                        );
+                                } else if (light.type === 'DirectionalLight') {
+                                    set('dirLightToggle', true);
+                                    if (light.color)
+                                        set('dirLightColor', light.color);
+                                    if (light.intensity !== undefined)
+                                        set(
+                                            'dirLightIntensity',
+                                            light.intensity,
+                                        );
+                                    if (Array.isArray(light.position)) {
+                                        set('dirLightPosX', light.position[0]);
+                                        set('dirLightPosY', light.position[1]);
+                                        set('dirLightPosZ', light.position[2]);
+                                    }
+                                    if (typeof light.castShadow === 'boolean')
+                                        set(
+                                            'dirLightCastShadow',
+                                            light.castShadow,
+                                        );
+                                }
+                            });
+                        }
+
+                        if (config.atmosphere.fog) {
+                            set('fogToggle', true);
+                            if (config.atmosphere.fog.color)
+                                set('fogColor', config.atmosphere.fog.color);
+                            if (config.atmosphere.fog.near !== undefined)
+                                set('fogNear', config.atmosphere.fog.near);
+                            if (config.atmosphere.fog.far !== undefined)
+                                set('fogFar', config.atmosphere.fog.far);
+                        } else {
+                            set('fogToggle', false);
+                        }
+                    }
+
+                    if (config.camera && config.camera.far) {
+                        set('cameraFar', config.camera.far);
+                    }
+
+                    if (
+                        Array.isArray(config.skybox) &&
+                        config.skybox.length === 6
+                    ) {
+                        set('skyboxToggle', true);
+                        set('skyboxPx', config.skybox[0]);
+                        set('skyboxNx', config.skybox[1]);
+                        set('skyboxPy', config.skybox[2]);
+                        set('skyboxNz', config.skybox[3]);
+                        set('skyboxPz', config.skybox[4]);
+                        set('skyboxNz', config.skybox[5]);
+                    } else {
+                        set('skyboxToggle', false);
+                    }
+
+                    if (config.tooltip) {
+                        set('tooltipToggle', true);
+                        set('tooltipText', config.tooltip.text || '');
+                        set('tooltipLink', config.tooltip.link || '');
+                    }
+
+                    const promises = Object.entries(updates).map(
+                        ([key, value]) => handleSaveSettings(key, value),
+                    );
+                    await Promise.all(promises);
+
+                    alert(
+                        ts('settings.ui.environment.imported'),
+                    );
+                    location.reload();
+                } catch (error) {
+                    console.error(
+                        'Failed to import environment config:',
+                        error,
+                    );
+                    alert(ts('settings.ui.environment.parseFailed'));
+                }
+            };
+            reader.readAsText(file);
+        };
+
+        input.click();
+    });
+
+    document.addEventListener('rovalra:showLocalStorageUsage', async () => {
+        chrome.storage.local.get(null, (items) => {
+            let totalBytes = 0;
+            for (const key in items) {
+                if (Object.prototype.hasOwnProperty.call(items, key)) {
+                    const item = items[key];
+                    const itemSize = JSON.stringify(item).length;
+                    totalBytes += itemSize;
+                }
+            }
+            alert(ts('settings.ui.environment.storageUsed', {
+                size: formatBytes(totalBytes),
+            }));
+        });
+    });
+
+    chrome.runtime.onMessage.addListener((request) => {
+        if (request.action === 'permissionsUpdated') {
+            updateAllPermissionToggles();
+        }
+    });
+
+    document.addEventListener('change', async (event) => {
+        const target = event.target;
+        const settingName = target.dataset.settingName;
+
+        if (target.matches('input[type="checkbox"][data-controls-setting]')) {
+            const controlledSettingName = target.dataset.controlsSetting;
+            const numberInput = document.getElementById(controlledSettingName);
+            const settingConfig = findSettingConfig(controlledSettingName);
+            const defaultValue =
+                settingConfig?.default !== undefined &&
+                settingConfig.default > 0
+                    ? settingConfig.default
+                    : 1;
+
+            if (numberInput) {
+                if (!target.checked) {
+                    numberInput.value = 0;
+                    numberInput.dispatchEvent(
+                        new Event('change', { bubbles: true }),
+                    );
+                } else {
+                    const currentValue = parseFloat(numberInput.value) || 0;
+                    if (currentValue === 0) {
+                        numberInput.value = defaultValue;
+                        numberInput.dispatchEvent(
+                            new Event('change', { bubbles: true }),
+                        );
+                    }
+                }
+            }
+        }
+
+        if (!settingName) return;
+
+        if (target.matches('input[type="file"]')) return;
+
+        const savePromises = [];
+        let value;
+
+        if (target.matches('input[type="checkbox"]')) {
+            value = target.checked;
+            const settingConfig = findSettingConfig(settingName);
+
+            if (value) {
+                if (
+                    target.dataset.featureStatusPromptAccepted !== 'true' &&
+                    (await shouldShowFeatureStatusPrompt(settingConfig))
+                ) {
+                    target.checked = false;
+                    const statusPills = getFeatureStatusPromptPills();
+                    showConfirmationPrompt({
+                        title: ts('settings.ui.featureStatus.title'),
+                        message:
+                            `<span style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px;">${statusPills}</span>` +
+                            ts('settings.ui.featureStatus.message'),
+                        confirmText: ts('settings.ui.featureStatus.acknowledge'),
+                        cancelText: ts('common.cancel'),
+                        confirmType: 'primary',
+                        cancelType: 'secondary',
+                        onConfirm: async () => {
+                            await markFeatureStatusPromptAcknowledged();
+                            target.dataset.featureStatusPromptAccepted = 'true';
+                            target.checked = true;
+                            target.dispatchEvent(
+                                new Event('change', { bubbles: true }),
+                            );
+                        },
+                        onCancel: () => {
+                            target.checked = false;
+                        },
+                    });
+                    return;
+                }
+
+                delete target.dataset.featureStatusPromptAccepted;
+
+                if (settingConfig?.requiredPermissions) {
+                    const missingPermissions = [];
+                    for (const perm of settingConfig.requiredPermissions) {
+                        const hasIt = await hasPermission(perm);
+                        if (!hasIt) missingPermissions.push(perm);
+                    }
+
+                    if (missingPermissions.length > 0) {
+                        const granted =
+                            await requestPermission(missingPermissions);
+
+                        if (!granted) {
+                            target.checked = false;
+                            console.log(
+                                `RoValra: Permission denied for ${settingName}`,
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                if (settingConfig?.exclusiveWith) {
+                    settingConfig.exclusiveWith.forEach(
+                        (exclusiveSettingName) => {
+                            if (
+                                findSettingConfig(exclusiveSettingName) != null
+                            ) {
+                                const exclusiveElement = document.querySelector(
+                                    `#${exclusiveSettingName}`,
+                                );
+                                if (exclusiveElement?.checked) {
+                                    exclusiveElement.checked = false;
+                                }
+                                savePromises.push(
+                                    handleSaveSettings(
+                                        exclusiveSettingName,
+                                        false,
+                                    ),
+                                );
+                            }
+                        },
+                    );
+                }
+
+                if (settingConfig?.dependsOn) {
+                    settingConfig.dependsOn.forEach((dependedSettingName) => {
+                        if (findSettingConfig(dependedSettingName) != null) {
+                            const dependedElement = document.querySelector(
+                                `#${dependedSettingName}`,
+                            );
+                            if (dependedElement?.checked === false) {
+                                dependedElement.checked = true;
+                            }
+                            savePromises.push(
+                                handleSaveSettings(dependedSettingName, true),
+                            );
+                        }
+                    });
+                }
+            } else {
+                if (settingConfig?.dependedBy) {
+                    settingConfig.dependedBy.forEach((dependedSettingName) => {
+                        if (findSettingConfig(dependedSettingName) != null) {
+                            const dependedElement = document.querySelector(
+                                `#${dependedSettingName}`,
+                            );
+                            if (dependedElement?.checked) {
+                                dependedElement.checked = false;
+                            }
+                            savePromises.push(
+                                handleSaveSettings(dependedSettingName, false),
+                            );
+                        }
+                    });
+                }
+            }
+
+            savePromises.push(handleSaveSettings(settingName, value));
+        } else if (target.matches('select')) {
+            value = target.value;
+            const previousLanguage =
+                settingName === 'rovalraLanguage'
+                    ? (await loadSettings()).rovalraLanguage
+                    : null;
+            savePromises.push(handleSaveSettings(settingName, value));
+            if (settingName === 'profileRenderEnvironment') {
+                const profileEnvs =
+                    SETTINGS_CONFIG.Profile.settings.profile3DRenderEnabled
+                        .childSettings.profileRenderEnvironment.options;
+                const selectedEnv = profileEnvs.find(
+                    (opt) => opt.value === value,
+                );
+                const envId = selectedEnv ? selectedEnv.id : 1;
+
+                const settings = await loadSettings();
+                const isDonator = currentUserTier >= 1;
+                if (isDonator && settings.profileRenderUseApi) {
+                    updateUserSettingViaApi('environment', envId).catch(
+                        (error) =>
+                            console.error(
+                                'RoValra: Environment sync failed',
+                                error,
+                            ),
+                    );
+                }
+            }
+            if (
+                settingName === 'rovalraLanguage' &&
+                value !== previousLanguage
+            ) {
+                await Promise.all(savePromises);
+                location.reload();
+                return;
+            }
+        } else if (
+            target.matches(
+                'input[type="text"], input[type="url"], input:not([type])',
+            )
+        ) {
+            value = target.value.trim() === '' ? null : target.value;
+            savePromises.push(handleSaveSettings(settingName, value));
+        } else if (target.matches('input[type="number"]')) {
+            const min = parseFloat(target.min) || 0;
+            const max = parseFloat(target.max) || Infinity;
+            value = Math.max(min, Math.min(max, parseFloat(target.value) || 0));
+
+            const toggleElement = document.querySelector(
+                `[data-controls-setting="${settingName}"]`,
+            );
+            if (toggleElement) {
+                toggleElement.checked = value > 0;
+            }
+            savePromises.push(handleSaveSettings(settingName, value));
+        } else if (target.matches('input[type="color"]')) {
+            value = target.value;
+            savePromises.push(handleSaveSettings(settingName, value));
+        } else {
+            return;
+        }
+
+        if (savePromises.length === 0) return;
+
+        Promise.all(savePromises)
+            .then(async () => {
+                const settingsContent = document.querySelector(
+                    '#setting-section-content',
+                );
+                if (settingsContent) {
+                    const currentSettings = await loadSettings();
+                    updateConditionalSettingsVisibility(
+                        settingsContent,
+                        currentSettings,
+                    );
+                    await checkSettingLocks(settingsContent, currentSettings);
+                    updateAllPermissionToggles();
+
+                    if (settingName === 'MemoryleakFixEnabled') {
+                        chrome.runtime.sendMessage({
+                            action: 'toggleMemoryLeakFix',
+                            enabled: currentSettings.MemoryleakFixEnabled,
+                        });
+                    }
+                }
+            })
+            .catch((error) => {
+                console.error('Error saving one or more settings:', error);
+            });
+    });
+
+    document.addEventListener('input', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLInputElement)) return;
+        if (target.type !== 'color') return;
+        const settingName = target.dataset.settingName;
+        if (!settingName) return;
+
+        const existing = colorLiveSaveTimeouts.get(settingName);
+        if (existing) clearTimeout(existing);
+        const timeoutId = setTimeout(() => {
+            colorLiveSaveTimeouts.delete(settingName);
+            handleSaveSettings(settingName, target.value).catch((error) => {
+                console.error('Error saving color setting:', error);
+            });
+        }, 80);
+        colorLiveSaveTimeouts.set(settingName, timeoutId);
+    });
+
+    document.addEventListener('click', (event) => {
+        const target = event.target;
+
+        const numberButton = target.closest('.rovalra-number-input-btn');
+        if (numberButton) {
+            const action = numberButton.dataset.action;
+            const inputId = numberButton.dataset.target;
+            const inputElement = document.getElementById(inputId);
+            if (inputElement) {
+                const step = parseFloat(inputElement.step) || 1;
+                const min = parseFloat(inputElement.min) || 0;
+                const max = parseFloat(inputElement.max) || Infinity;
+                let currentValue = parseFloat(inputElement.value) || 0;
+                currentValue =
+                    action === 'increment'
+                        ? currentValue + step
+                        : currentValue - step;
+                inputElement.value = Math.max(min, Math.min(max, currentValue));
+                inputElement.dispatchEvent(
+                    new Event('change', { bubbles: true }),
+                );
+            }
+        }
+
+        if (target.id?.startsWith('clear-')) {
+            const settingName = target.dataset.settingName;
+            if (settingName) {
+                const fileUploadWrapper = document.querySelector(
+                    `[data-setting-name="${settingName}"]`,
+                );
+                if (fileUploadWrapper && fileUploadWrapper.rovalraFileUpload) {
+                    const clearButton = fileUploadWrapper.querySelector(
+                        `#${settingName}-clear`,
+                    );
+                    if (clearButton) clearButton.click();
+                } else {
+                    handleSaveSettings(settingName, null);
+                    target.style.display = 'none';
+                }
+            }
+        }
+    });
+}
